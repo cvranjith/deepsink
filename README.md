@@ -156,11 +156,12 @@ POST /v1/invoke
 ```
 
 One call for a session's whole set of chunks, not one per chunk — see
-"Speaker detection" above for why. **Not yet verified end to end with a
-real HuggingFace token** — see `ai-gateway`'s README
-("deepsink_diarize setup") for the one remaining manual step
-(sign up, accept two model licenses, generate a token, save it to
-`hf_token.txt`), after which no code change is needed on either side.
+"Speaker detection" above for why. **Verified end to end** (HuggingFace
+setup done — see `ai-gateway`'s README for what that took, including a
+third gated repo the setup instructions didn't originally call out):
+a synthetic 3-turn, 2-speaker conversation (A, B, A) correctly diarized
+the two A turns as the same speaker despite being separate chunk files,
+both directly against the gateway and through the live deployed router.
 
 All four `deepsink.*` services and the `project` option above are wired up
 and deployed — see `ai-router` and `ai-gateway`'s own READMEs for the

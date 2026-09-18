@@ -52,9 +52,11 @@ see the app's README and `ai-gateway`'s own README ("deepsink_diarize
 setup") for why it's isolated and the one-time HuggingFace token setup
 this needs. `TranscriptBlock.speakerID` + `Session.speakers` (a
 rename-able "Person 1"/"Person 2"/... map) is exactly the shape this note
-originally guessed at. Not yet verified end to end with a real
-HuggingFace token — the setup step was still in progress when this was
-built; see the app's README for the exact remaining step.
+originally guessed at. Verified end to end (backend side) once
+HuggingFace setup completed — see the app's README's "deepsink.diarize"
+section. Still untested from the actual app UI (the "Detect Speakers"
+button on a real recorded session) — worth trying on a real meeting with
+more than one speaker.
 
 ## Transcript translation / multilingual display
 
