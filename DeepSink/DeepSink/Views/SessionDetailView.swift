@@ -4,8 +4,6 @@
 //
 
 import SwiftUI
-import SwiftData
-import AVFoundation
 
 private enum SessionTab: String, CaseIterable, Identifiable {
     case notes = "Notes"
@@ -20,16 +18,24 @@ private enum SessionTab: String, CaseIterable, Identifiable {
 // speakers, and background notes into a single List, which got
 // cluttered fast. Split along the same lines comparable apps use
 // (Summary/Transcript/Chat-style tab bars): generated notes, transcript
-// (with markers and speaker renaming folded in, since both are
+// (with markers and speakers folded in, since both are
 // transcript-contextual), action items, and the user's own background
 // notes each get their own tab. Title, processing state, and
 // share/delete stay in the header/toolbar since they apply regardless
 // of which tab is showing.
+//
+// `session` is seeded once from whatever the caller had (list row, home
+// card, or a just-finished recording) and then only ever moves forward
+// via a full-session response from RouterClient — never a local mutation
+// that isn't also sent to the server. There is exactly one writer (the
+// server); this view just renders its latest answer and immediately
+// forwards every write's response to DeepSinkSessionStore so other
+// screens see it too.
 struct SessionDetailView: View {
-    @Bindable var session: Session
+    @State private var session: DeepSinkSession
     @EnvironmentObject var settings: AppSettings
-    @EnvironmentObject var sessionProcessor: SessionProcessor
-    @Environment(\.modelContext) private var modelContext
+    @EnvironmentObject var routerClient: RouterClient
+    @EnvironmentObject var sessionStore: DeepSinkSessionStore
     @Environment(\.dismiss) private var dismiss
 
     @State private var isEditingTitle = false
@@ -37,6 +43,14 @@ struct SessionDetailView: View {
     @State private var shareText = ""
     @State private var isDeleting = false
     @State private var selectedTab: SessionTab = .notes
+    @State private var isRegeneratingNotes = false
+    @State private var actionErrorMessage: String?
+    @State private var diarizationErrorMessage: String?
+    @State private var notesSaveTask: Task<Void, Never>?
+
+    init(session: DeepSinkSession) {
+        _session = State(initialValue: session)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -55,7 +69,7 @@ struct SessionDetailView: View {
                     } label: {
                         Label("Export", systemImage: "square.and.arrow.up")
                     }
-                    .disabled(session.state.stage != .ready)
+                    .disabled(session.stageValue != .ready)
 
                     Button(role: .destructive) {
                         isDeleting = true
@@ -74,15 +88,33 @@ struct SessionDetailView: View {
             Button("Delete", role: .destructive) { deleteSession() }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("This also deletes its audio, if any is still kept.")
+            Text("This also deletes its audio and transcript on the server.")
         }
         .alert("Speaker Detection", isPresented: Binding(
-            get: { session.diarizationError != nil },
-            set: { if !$0 { session.diarizationError = nil } }
+            get: { diarizationErrorMessage != nil },
+            set: { if !$0 { diarizationErrorMessage = nil } }
         )) {
             Button("OK", role: .cancel) {}
         } message: {
-            Text(session.diarizationError ?? "")
+            Text(diarizationErrorMessage ?? "")
+        }
+        .alert("Session", isPresented: Binding(
+            get: { actionErrorMessage != nil },
+            set: { if !$0 { actionErrorMessage = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(actionErrorMessage ?? "")
+        }
+        .task {
+            // The list/card this view was pushed from may be showing a
+            // slightly stale snapshot (e.g. a chunk uploaded a moment
+            // after the caller last refreshed) — one fetch on appear
+            // catches it up without waiting on a background poll.
+            if case .success(let latest) = await routerClient.getSession(id: session.id, settings: settings) {
+                session = latest
+                sessionStore.apply(latest)
+            }
         }
     }
 
@@ -93,7 +125,7 @@ struct SessionDetailView: View {
             if isEditingTitle {
                 TextField("Title", text: $session.title, onCommit: {
                     isEditingTitle = false
-                    try? modelContext.save()
+                    patchField(["title": session.title])
                 })
                 .font(.title3.bold())
             } else {
@@ -108,12 +140,12 @@ struct SessionDetailView: View {
                 .buttonStyle(.plain)
             }
             HStack {
-                Label(session.state.label, systemImage: stateIcon)
+                Label(session.stageLabel, systemImage: session.stageIcon)
                     .font(.footnote)
-                    .foregroundStyle(stateColor)
+                    .foregroundStyle(session.stageColor)
                 Spacer()
-                if session.state.stage == .failed {
-                    Button("Retry") { retry() }
+                if session.stageValue == .failed {
+                    Button("Retry") { regenerateNotes() }
                         .font(.footnote)
                 }
             }
@@ -123,7 +155,7 @@ struct SessionDetailView: View {
                     .foregroundStyle(.orange)
             }
             if session.audioDeleted {
-                Label("Audio auto-deleted after \(settings.deleteAudioAfterDays) days.", systemImage: "trash")
+                Label("Audio has been deleted from the server.", systemImage: "trash")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -194,13 +226,18 @@ struct SessionDetailView: View {
             }
             if session.notes == nil {
                 Section {
-                    Text(session.state.stage == .failed ? "Notes failed to generate — retry from the header above." : "Notes aren't ready yet.")
+                    Text(session.stageValue == .failed ? "Notes failed to generate — retry from the header above." : "Notes aren't ready yet.")
                         .foregroundStyle(.secondary)
                 }
             }
-            if session.state.stage == .ready {
+            if session.stageValue == .ready {
                 Section {
-                    Button("Regenerate notes") { retry(regenerateOnly: true) }
+                    Button {
+                        regenerateNotes()
+                    } label: {
+                        if isRegeneratingNotes { ProgressView() } else { Text("Regenerate notes") }
+                    }
+                    .disabled(isRegeneratingNotes)
                 }
             }
         }
@@ -210,22 +247,29 @@ struct SessionDetailView: View {
 
     private var transcriptTab: some View {
         List {
-            if session.state.stage == .ready {
+            if session.stageValue == .ready {
                 Section {
                     speakerDetectionRow
                 } footer: {
                     if session.audioDeleted {
-                        Text("Detect Speakers needs the session's audio, which has already been auto-deleted.")
+                        Text("Detect Speakers needs the session's audio, which has already been deleted.")
                     }
                 }
             }
             if session.isDiarized {
-                Section("Speakers") {
+                Section {
                     ForEach(session.speakers) { speaker in
-                        SpeakerRenameRow(session: session, speaker: speaker) {
-                            try? modelContext.save()
-                        }
+                        Text(speaker.displayName)
                     }
+                } header: {
+                    Text("Speakers")
+                } footer: {
+                    // Renaming isn't wired up in this pass: the server has
+                    // no endpoint to persist a speaker rename (PATCH on a
+                    // session only accepts title/background_notes/
+                    // duration_seconds/recording_incomplete) — see
+                    // SessionSpeaker's own comment.
+                    Text("Speaker names are assigned automatically and can't be renamed yet.")
                 }
             }
             if !session.markers.isEmpty {
@@ -254,7 +298,7 @@ struct SessionDetailView: View {
             HStack { ProgressView(); Text("Detecting speakers…") }
         } else if !session.audioDeleted {
             Button(session.isDiarized ? "Re-detect Speakers" : "Detect Speakers") {
-                sessionProcessor.diarize(session: session, settings: settings, modelContext: modelContext)
+                detectSpeakers()
             }
         }
     }
@@ -271,7 +315,9 @@ struct SessionDetailView: View {
             } else {
                 Section {
                     ForEach(session.actionItems.sorted { $0.sortOrder < $1.sortOrder }) { item in
-                        ActionItemRow(item: item, onToggle: { try? modelContext.save() })
+                        ActionItemRow(item: item) {
+                            toggleActionItem(item)
+                        }
                     }
                 } footer: {
                     Text("\(session.openActionItemCount) open of \(session.actionItems.count).")
@@ -287,13 +333,17 @@ struct SessionDetailView: View {
             Section {
                 TextEditor(text: $session.backgroundNotes)
                     .frame(minHeight: 200)
-                    // Saved on every change rather than gated behind
-                    // losing focus: dictation (DictationButton) writes to
-                    // this same binding without the TextEditor itself
-                    // ever gaining focus, so a focus-only save would miss
-                    // dictated text entirely.
+                    // Debounced rather than saved on every keystroke: this
+                    // used to be "free" (a local SwiftData write), but now
+                    // every save is a network PATCH, so a short pause
+                    // after typing stops — not the very next character —
+                    // is what triggers the request. Dictation
+                    // (DictationButton) writes to this same binding
+                    // without the TextEditor ever gaining focus, so a
+                    // focus-only save would still miss dictated text; this
+                    // still catches it since it fires on any change.
                     .onChange(of: session.backgroundNotes) { _, _ in
-                        try? modelContext.save()
+                        scheduleBackgroundNotesSave()
                     }
             } header: {
                 HStack {
@@ -307,39 +357,97 @@ struct SessionDetailView: View {
         }
     }
 
-    private var stateIcon: String {
-        switch session.state.stage {
-        case .recording: return "mic.fill"
-        case .uploading, .transcribing: return "arrow.up.circle"
-        case .summarising: return "sparkles"
-        case .ready: return "checkmark.circle.fill"
-        case .failed: return "exclamationmark.triangle.fill"
+    private func patchField(_ fields: [String: Any]) {
+        Task {
+            let result = await routerClient.updateSession(id: session.id, fields: fields, settings: settings)
+            switch result {
+            case .success(let updated):
+                session = updated
+                sessionStore.apply(updated)
+            case .failure(let error):
+                actionErrorMessage = error.message
+            }
         }
     }
 
-    private var stateColor: Color {
-        switch session.state.stage {
-        case .ready: return .green
-        case .failed: return .red
-        default: return .secondary
+    private func scheduleBackgroundNotesSave() {
+        notesSaveTask?.cancel()
+        let text = session.backgroundNotes
+        notesSaveTask = Task {
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            guard !Task.isCancelled else { return }
+            let result = await routerClient.updateSession(id: session.id, fields: ["background_notes": text], settings: settings)
+            if case .success(let updated) = result {
+                session = updated
+                sessionStore.apply(updated)
+            }
         }
     }
 
-    private func retry(regenerateOnly: Bool = false) {
-        if regenerateOnly {
-            sessionProcessor.retryNotes(session: session, settings: settings, modelContext: modelContext)
-        } else {
-            sessionProcessor.process(session: session, settings: settings, modelContext: modelContext)
+    private func toggleActionItem(_ item: ServerActionItem) {
+        guard let index = session.actionItems.firstIndex(where: { $0.id == item.id }) else { return }
+        let newValue = !item.isChecked
+        session.actionItems[index].isChecked = newValue
+        Task {
+            let result = await routerClient.toggleActionItem(sessionID: session.id, itemID: item.id, isChecked: newValue, settings: settings)
+            switch result {
+            case .success(let updated):
+                session = updated
+                sessionStore.apply(updated)
+            case .failure(let error):
+                if let index = session.actionItems.firstIndex(where: { $0.id == item.id }) {
+                    session.actionItems[index].isChecked = !newValue
+                }
+                actionErrorMessage = error.message
+            }
+        }
+    }
+
+    private func detectSpeakers() {
+        session.isDiarizing = true
+        Task {
+            let result = await routerClient.diarizeSession(id: session.id, settings: settings)
+            switch result {
+            case .success(let updated):
+                session = updated
+                sessionStore.apply(updated)
+            case .failure(let error):
+                session.isDiarizing = false
+                diarizationErrorMessage = error.message
+            }
+        }
+    }
+
+    // No standalone "retry a failed chunk upload" anymore — the failed
+    // chunk (if any) never made it to the server, so there's nothing
+    // server-side to resume from this screen. What "Retry" can still
+    // reliably do is re-run note generation over whatever transcript did
+    // make it through.
+    private func regenerateNotes() {
+        isRegeneratingNotes = true
+        Task {
+            let result = await routerClient.regenerateNotes(id: session.id, settings: settings)
+            isRegeneratingNotes = false
+            switch result {
+            case .success(let updated):
+                session = updated
+                sessionStore.apply(updated)
+            case .failure(let error):
+                actionErrorMessage = error.message
+            }
         }
     }
 
     private func deleteSession() {
-        for chunk in session.chunks {
-            try? FileManager.default.removeItem(at: AudioRecorder.audioDirectory.appendingPathComponent(chunk.fileName))
+        Task {
+            let result = await routerClient.deleteSession(id: session.id, settings: settings)
+            if case .failure(let error) = result {
+                actionErrorMessage = error.message
+                return
+            }
+            sessionStore.remove(id: session.id)
+            dismiss()
         }
-        modelContext.delete(session)
-        try? modelContext.save()
-        dismiss()
     }
 
     private func formattedOffset(_ seconds: Double) -> String {
@@ -348,44 +456,12 @@ struct SessionDetailView: View {
     }
 }
 
-// A plain text field per speaker, committed on submit — `session.speakers`
-// is a computed property over a JSON blob (see Session.swift), not a
-// stored SwiftData property, so this reads/writes it wholesale rather
-// than trying to bind through it directly.
-private struct SpeakerRenameRow: View {
-    @Bindable var session: Session
-    let speaker: SessionSpeaker
-    var onSave: () -> Void
-
-    @State private var name: String = ""
-
-    var body: some View {
-        TextField("Speaker name", text: $name)
-            .onAppear { name = speaker.displayName }
-            .onSubmit { rename() }
-    }
-
-    private func rename() {
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, trimmed != speaker.displayName else {
-            name = speaker.displayName
-            return
-        }
-        var updated = session.speakers
-        guard let idx = updated.firstIndex(where: { $0.id == speaker.id }) else { return }
-        updated[idx].displayName = trimmed
-        session.speakers = updated
-        onSave()
-    }
-}
-
 private struct ActionItemRow: View {
-    @Bindable var item: ActionItem
+    let item: ServerActionItem
     var onToggle: () -> Void
 
     var body: some View {
         Button {
-            item.isChecked.toggle()
             onToggle()
         } label: {
             HStack(alignment: .top, spacing: 10) {
@@ -410,77 +486,32 @@ private struct ActionItemRow: View {
     }
 }
 
-// The transcript-block list + playback, factored out of the old
-// standalone TranscriptView so it can sit inline inside the Transcript
-// tab's List rather than behind a NavigationLink push — same content,
-// same playback behavior, just embedded instead of a separate screen.
+// The transcript-block list, factored out of the old standalone
+// TranscriptView so it can sit inline inside the Transcript tab's List
+// rather than behind a NavigationLink push. No tap-to-play anymore: the
+// server deletes a chunk's audio once it's been transcribed (see
+// DeepSinkSession.audioDeleted), and there's no download endpoint to
+// fetch it back — this now shows plain, non-interactive rows.
 private struct TranscriptBlocksList: View {
-    let session: Session
-    @State private var player: AVAudioPlayer?
-    @State private var playingBlockID: UUID?
-    @State private var playbackError: String?
+    let session: DeepSinkSession
 
     var body: some View {
-        Group {
-            if session.audioDeleted {
-                Text("Audio has been deleted — transcript text is still available, but blocks can't be played back.")
-                    .font(.caption)
+        ForEach(session.transcriptBlocks.sorted(by: { $0.startSeconds < $1.startSeconds })) { block in
+            HStack(alignment: .top, spacing: 10) {
+                Text(formattedOffset(block.startSeconds))
+                    .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
-            }
-            ForEach(session.transcriptBlocks.sorted(by: { $0.startSeconds < $1.startSeconds })) { block in
-                Button {
-                    play(block: block)
-                } label: {
-                    HStack(alignment: .top, spacing: 10) {
-                        Text(formattedOffset(block.startSeconds))
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                            .frame(width: 48, alignment: .leading)
-                        VStack(alignment: .leading, spacing: 2) {
-                            if let speakerName = session.displayName(forSpeakerID: block.speakerID) {
-                                Text(speakerName)
-                                    .font(.caption.weight(.semibold))
-                                    .foregroundStyle(.indigo)
-                            }
-                            Text(block.text)
-                                .foregroundStyle(.primary)
-                        }
-                        Spacer()
-                        if playingBlockID == block.id {
-                            Image(systemName: "speaker.wave.2.fill").foregroundStyle(.blue)
-                        }
+                    .frame(width: 48, alignment: .leading)
+                VStack(alignment: .leading, spacing: 2) {
+                    if let speakerName = session.displayName(forSpeakerID: block.speakerID) {
+                        Text(speakerName)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.indigo)
                     }
+                    Text(block.text)
+                        .foregroundStyle(.primary)
                 }
-                .buttonStyle(.plain)
-                .disabled(session.audioDeleted)
             }
-        }
-        .alert("Playback", isPresented: Binding(get: { playbackError != nil }, set: { if !$0 { playbackError = nil } })) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text(playbackError ?? "")
-        }
-        .onDisappear { player?.stop() }
-    }
-
-    private func play(block: TranscriptBlock) {
-        guard let chunk = session.chunks.first(where: {
-            block.startSeconds >= $0.startOffsetSeconds && block.startSeconds < $0.startOffsetSeconds + $0.durationSeconds
-        }) else {
-            playbackError = "Couldn't find the audio for this moment."
-            return
-        }
-        let url = AudioRecorder.audioDirectory.appendingPathComponent(chunk.fileName)
-        do {
-            let newPlayer = try AVAudioPlayer(contentsOf: url)
-            try AVAudioSession.sharedInstance().setCategory(.playback)
-            try AVAudioSession.sharedInstance().setActive(true)
-            newPlayer.currentTime = max(0, block.startSeconds - chunk.startOffsetSeconds)
-            newPlayer.play()
-            player = newPlayer
-            playingBlockID = block.id
-        } catch {
-            playbackError = "Couldn't play this chunk: \(error.localizedDescription)"
         }
     }
 

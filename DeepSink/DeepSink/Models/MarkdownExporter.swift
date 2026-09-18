@@ -9,7 +9,7 @@ import Foundation
 // pastes usefully into a notes system) and as plain text, both via the
 // standard share sheet — see ActivityView.
 enum MarkdownExporter {
-    static func markdown(for session: Session) -> String {
+    static func markdown(for session: DeepSinkSession) -> String {
         var lines: [String] = []
         lines.append("# \(session.title)")
         lines.append("")
@@ -72,7 +72,7 @@ enum MarkdownExporter {
         return lines.joined(separator: "\n")
     }
 
-    static func plainText(for session: Session) -> String {
+    static func plainText(for session: DeepSinkSession) -> String {
         markdown(for: session)
             .replacingOccurrences(of: "## ", with: "")
             .replacingOccurrences(of: "# ", with: "")

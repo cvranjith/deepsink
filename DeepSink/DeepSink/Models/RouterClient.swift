@@ -28,14 +28,6 @@ enum RouterError: Error {
     }
 }
 
-// One chunk's raw audio, ready to hand to `diarize` — the caller (see
-// SessionProcessor) reads each chunk file off disk; RouterClient itself
-// never touches the filesystem, same separation `transcribe` already has.
-struct DiarizationChunkInput {
-    let data: Data
-    let startOffsetSeconds: Double
-}
-
 struct RouterDeployWifiInfo {
     let ssid: String?
     let ip: String?
@@ -59,12 +51,148 @@ struct RouterDeployStatusInfo {
 // never touches a View: every call site above this type only ever sees
 // plain Swift types.
 //
-// `deepsink.transcribe` and `deepsink.notes` are NOT live on ai-router
-// yet as of this app's first cut — see README's "Router contract" for
-// the exact extension this needs server-side. Calls against them will
-// fail with a clear, retryable error (unknown_service) until that lands;
-// nothing here needs to change when it does.
+// Two request shapes live here side by side:
+//   - `invoke(...)` — the original `/v1/invoke` envelope
+//     (`{service, input, options}` -> `{output}`), used by `articulate`
+//     and the deploy calls, both genuinely stateless AI/action calls.
+//   - `restRequest(...)` — plain REST against `/deepsink/sessions/*`
+//     (ai-router proxies this straight through to ai-gateway's own
+//     session store; see that project's README). This is real, stateful
+//     CRUD, not an AI call, so it isn't forced into the invoke envelope —
+//     method/path/body/status all pass through as-is, and every write
+//     endpoint returns the full, current session.
 final class RouterClient: ObservableObject {
+
+    // MARK: - Session store (server is the source of truth — see
+    // DeepSinkSession's own doc comment)
+
+    private static let sessionDecoder: JSONDecoder = {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        // Python's `datetime.isoformat()` (what ai-gateway's
+        // session_store.py stamps every timestamp with) includes
+        // fractional seconds and a "+00:00" offset rather than "Z" —
+        // Foundation's plain `.iso8601` strategy doesn't parse that, so
+        // this tries a fractional-seconds-aware formatter first and
+        // falls back to a plain one, covering both shapes rather than
+        // assuming one.
+        let withFractional = ISO8601DateFormatter()
+        withFractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let withoutFractional = ISO8601DateFormatter()
+        withoutFractional.formatOptions = [.withInternetDateTime]
+        decoder.dateDecodingStrategy = .custom { decoder in
+            let container = try decoder.singleValueContainer()
+            let string = try container.decode(String.self)
+            if let date = withFractional.date(from: string) { return date }
+            if let date = withoutFractional.date(from: string) { return date }
+            throw DecodingError.dataCorruptedError(in: container, debugDescription: "Invalid ISO8601 date: \(string)")
+        }
+        return decoder
+    }()
+
+    private struct SessionListResponse: Decodable {
+        var sessions: [DeepSinkSession]
+    }
+
+    func listSessions(settings: AppSettings) async -> Result<[DeepSinkSession], RouterError> {
+        let result = await restRequest(method: "GET", path: "deepsink/sessions", body: nil, settings: settings, timeout: 30)
+        switch result {
+        case .success(let data):
+            guard let wrapper = try? Self.sessionDecoder.decode(SessionListResponse.self, from: data) else {
+                return .failure(.decoding)
+            }
+            return .success(wrapper.sessions)
+        case .failure(let error):
+            return .failure(error)
+        }
+    }
+
+    func createSession(title: String, settings: AppSettings) async -> Result<DeepSinkSession, RouterError> {
+        decodeSessionResult(await restRequest(method: "POST", path: "deepsink/sessions", body: ["title": title], settings: settings, timeout: 30))
+    }
+
+    func getSession(id: String, settings: AppSettings) async -> Result<DeepSinkSession, RouterError> {
+        decodeSessionResult(await restRequest(method: "GET", path: "deepsink/sessions/\(id)", body: nil, settings: settings, timeout: 30))
+    }
+
+    // `fields` is a small allowlisted set server-side — title,
+    // background_notes, duration_seconds, recording_incomplete — see
+    // deepsink_sessions.py's patch_session.
+    func updateSession(id: String, fields: [String: Any], settings: AppSettings) async -> Result<DeepSinkSession, RouterError> {
+        decodeSessionResult(await restRequest(method: "PATCH", path: "deepsink/sessions/\(id)", body: fields, settings: settings, timeout: 30))
+    }
+
+    func deleteSession(id: String, settings: AppSettings) async -> Result<Void, RouterError> {
+        switch await restRequest(method: "DELETE", path: "deepsink/sessions/\(id)", body: nil, settings: settings, timeout: 30) {
+        case .success: return .success(())
+        case .failure(let error): return .failure(error)
+        }
+    }
+
+    // Doubles as the transcription call now — the server transcribes via
+    // Whisper and persists the chunk + transcript blocks in one request,
+    // so this needs the same generous timeout deepsink.transcribe used
+    // to get for the same reason (CPU-only Whisper on the Mac mini).
+    func uploadChunk(
+        sessionID: String,
+        chunkIndex: Int,
+        startOffsetSeconds: Double,
+        durationSeconds: Double,
+        audioData: Data,
+        format: String = "m4a",
+        settings: AppSettings
+    ) async -> Result<DeepSinkSession, RouterError> {
+        let body: [String: Any] = [
+            "audio_base64": audioData.base64EncodedString(),
+            "chunk_index": chunkIndex,
+            "start_offset_seconds": startOffsetSeconds,
+            "duration_seconds": durationSeconds,
+            "format": format,
+        ]
+        return decodeSessionResult(await restRequest(method: "POST", path: "deepsink/sessions/\(sessionID)/chunks", body: body, settings: settings, timeout: 300))
+    }
+
+    // Codex over the accumulated transcript can take a while — same
+    // budget deepsink.notes used to get.
+    func finishSession(id: String, settings: AppSettings) async -> Result<DeepSinkSession, RouterError> {
+        decodeSessionResult(await restRequest(method: "POST", path: "deepsink/sessions/\(id)/finish", body: nil, settings: settings, timeout: 180))
+    }
+
+    func regenerateNotes(id: String, settings: AppSettings) async -> Result<DeepSinkSession, RouterError> {
+        decodeSessionResult(await restRequest(method: "POST", path: "deepsink/sessions/\(id)/notes/regenerate", body: nil, settings: settings, timeout: 180))
+    }
+
+    func toggleActionItem(sessionID: String, itemID: String, isChecked: Bool, settings: AppSettings) async -> Result<DeepSinkSession, RouterError> {
+        decodeSessionResult(await restRequest(method: "PATCH", path: "deepsink/sessions/\(sessionID)/action_items/\(itemID)", body: ["is_checked": isChecked], settings: settings, timeout: 30))
+    }
+
+    func addMarker(sessionID: String, offsetSeconds: Double, comment: String?, settings: AppSettings) async -> Result<DeepSinkSession, RouterError> {
+        var body: [String: Any] = ["offset_seconds": offsetSeconds]
+        if let comment { body["comment"] = comment }
+        return decodeSessionResult(await restRequest(method: "POST", path: "deepsink/sessions/\(sessionID)/markers", body: body, settings: settings, timeout: 30))
+    }
+
+    // Diarizing a long meeting on CPU can take many minutes — matches
+    // the gateway's own 1800s subprocess timeout for deepsink_diarize.
+    // The server tracks `is_diarizing` itself, but since this call is a
+    // single, directly-awaited HTTP request (not a start/poll pair), the
+    // client doesn't need to poll separately — it already blocks until
+    // the real answer comes back.
+    func diarizeSession(id: String, settings: AppSettings) async -> Result<DeepSinkSession, RouterError> {
+        decodeSessionResult(await restRequest(method: "POST", path: "deepsink/sessions/\(id)/diarize", body: nil, settings: settings, timeout: 1800))
+    }
+
+    private func decodeSessionResult(_ result: Result<Data, RouterError>) -> Result<DeepSinkSession, RouterError> {
+        switch result {
+        case .success(let data):
+            guard let session = try? Self.sessionDecoder.decode(DeepSinkSession.self, from: data) else {
+                return .failure(.decoding)
+            }
+            return .success(session)
+        case .failure(let error):
+            return .failure(error)
+        }
+    }
 
     // Sends a deliberately unknown service ID and reads the *shape* of
     // the rejection, same trick as yt-run's AIGatewayClient: 401 means
@@ -82,85 +210,16 @@ final class RouterClient: ObservableObject {
         }
     }
 
-    // Chunk audio is sent as base64 in the JSON body — simplest possible
-    // contract for a router this small; worth revisiting as real
-    // multipart only if chunk sizes ever make base64's ~33% overhead
-    // matter (see README's math on why chunks stay small).
-    func transcribe(
-        chunkData: Data,
-        chunkIndex: Int,
-        startOffsetSeconds: Double,
-        settings: AppSettings
-    ) async -> Result<[TranscriptBlock], RouterError> {
-        let options: [String: Any] = [
-            "chunk_index": chunkIndex,
-            "start_offset_seconds": startOffsetSeconds,
-            "format": "m4a",
-        ]
-        let result = await invoke(
-            service: "deepsink.transcribe",
-            input: chunkData.base64EncodedString(),
-            options: options,
-            settings: settings,
-            timeout: 180
-        )
-        switch result {
-        case .success(let json):
-            if let blocksJSON = json["blocks"] as? [[String: Any]] {
-                let blocks = blocksJSON.compactMap { dict -> TranscriptBlock? in
-                    guard let text = dict["text"] as? String else { return nil }
-                    let start = dict["start"] as? Double ?? startOffsetSeconds
-                    let end = dict["end"] as? Double ?? start
-                    return TranscriptBlock(startSeconds: start, endSeconds: end, text: text)
-                }
-                return .success(blocks)
-            }
-            // Tolerates a simpler first router implementation that just
-            // returns plain text with no block boundaries yet.
-            if let text = (json["text"] as? String) ?? (json["output"] as? String) {
-                return .success([TranscriptBlock(startSeconds: startOffsetSeconds, endSeconds: startOffsetSeconds, text: text)])
-            }
-            return .failure(.decoding)
-        case .failure(let error):
-            return .failure(error)
-        }
-    }
-
-    func generateNotes(
-        transcript: String,
-        markers: [Marker],
-        backgroundNotes: String,
-        settings: AppSettings
-    ) async -> Result<SessionNotesPayload, RouterError> {
-        let markerHints = markers
-            .sorted { $0.offsetSeconds < $1.offsetSeconds }
-            .map { ["offset_seconds": $0.offsetSeconds, "comment": $0.comment ?? ""] as [String: Any] }
-        let result = await invoke(
-            service: "deepsink.notes",
-            input: transcript,
-            options: ["marker_hints": markerHints, "background_notes": backgroundNotes],
-            settings: settings,
-            timeout: 120
-        )
-        switch result {
-        case .success(let json):
-            guard let data = try? JSONSerialization.data(withJSONObject: json),
-                  let payload = try? JSONDecoder().decode(SessionNotesPayload.self, from: data) else {
-                return .failure(.decoding)
-            }
-            return .success(payload)
-        case .failure(let error):
-            return .failure(error)
-        }
-    }
-
     // A short, recent transcript excerpt (typically the last few
     // minutes, from LiveAssistEngine's on-device recognition — not the
     // full accurate transcript) in, quick bullets + a spoken-style draft
     // out. Meant to be waited on mid-meeting, so this gets a generous
     // timeout for the same reason the deploy calls do — see that MARK's
     // comment for the measured Funnel latency this needs to absorb, on
-    // top of however long Codex itself takes.
+    // top of however long Codex itself takes. Deliberately still
+    // stateless/on-device: Articulate never touches the server session
+    // store, since it needs to work off text that's fresher than
+    // whatever's landed there so far.
     func articulate(recentTranscript: String, backgroundNotes: String, settings: AppSettings) async -> Result<ArticulateResponse, RouterError> {
         let result = await invoke(service: "deepsink.articulate", input: recentTranscript, options: ["background_notes": backgroundNotes], settings: settings, timeout: 100)
         switch result {
@@ -170,46 +229,6 @@ final class RouterClient: ObservableObject {
                 return .failure(.decoding)
             }
             return .success(payload)
-        case .failure(let error):
-            return .failure(error)
-        }
-    }
-
-    // A whole session's audio, one chunk file per entry — deliberately
-    // one call for the whole session rather than one per chunk, since a
-    // diarization speaker label like "SPEAKER_00" is only consistent
-    // within a single diarization pass; running it per chunk would give
-    // inconsistent numbering across a session. This is the slowest call
-    // this app makes by far (diarizing a long meeting on CPU can take
-    // many minutes, not seconds — see ai-router's own comment on why the
-    // Worker-side timeout matches deepsink_diarize's default 1800s
-    // subprocess timeout), so this gets a matching generous timeout
-    // rather than the "just absorb Funnel latency variance" numbers
-    // elsewhere in this file. For a very long meeting this could still
-    // legitimately take longer than even this — no async start/poll
-    // pattern like the deploy calls have yet; a known limitation, not an
-    // oversight (see README).
-    func diarize(chunks: [DiarizationChunkInput], settings: AppSettings) async -> Result<[DiarizationSegment], RouterError> {
-        let chunkParts: [[String: Any]] = chunks.map {
-            ["audio_base64": $0.data.base64EncodedString(), "start_offset_seconds": $0.startOffsetSeconds]
-        }
-        let result = await invoke(
-            service: "deepsink.diarize",
-            input: chunkParts,
-            options: ["format": "m4a"],
-            settings: settings,
-            timeout: 1200
-        )
-        switch result {
-        case .success(let json):
-            guard let segmentsJSON = json["segments"] as? [[String: Any]] else { return .failure(.decoding) }
-            let segments = segmentsJSON.compactMap { dict -> DiarizationSegment? in
-                guard let start = dict["start"] as? Double,
-                      let end = dict["end"] as? Double,
-                      let speaker = dict["speaker"] as? String else { return nil }
-                return DiarizationSegment(start: start, end: end, speaker: speaker)
-            }
-            return .success(segments)
         case .failure(let error):
             return .failure(error)
         }
@@ -261,7 +280,7 @@ final class RouterClient: ObservableObject {
         }
     }
 
-    // MARK: - Transport
+    // MARK: - Transport (/v1/invoke envelope — stateless AI/action calls)
 
     private func invoke(
         service: String,
@@ -306,6 +325,48 @@ final class RouterClient: ObservableObject {
             return .failure(.server(message))
         }
         return .success((json["output"] as? [String: Any]) ?? json)
+    }
+
+    // MARK: - Transport (plain REST — /deepsink/sessions/*)
+
+    private func restRequest(
+        method: String,
+        path: String,
+        body: [String: Any]?,
+        settings: AppSettings,
+        timeout: TimeInterval
+    ) async -> Result<Data, RouterError> {
+        guard let baseURL = Self.baseURL(from: settings) else {
+            return .failure(settings.routerURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .notConfigured : .invalidURL)
+        }
+        let token = settings.routerToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty else { return .failure(.notConfigured) }
+
+        var request = URLRequest(url: baseURL.appendingPathComponent(path))
+        request.httpMethod = method
+        request.timeoutInterval = timeout
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        if let body {
+            request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        }
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await URLSession.shared.data(for: request)
+        } catch {
+            if (error as NSError).code == NSURLErrorCancelled { return .failure(.cancelled) }
+            return .failure(.network(error))
+        }
+
+        guard let http = response as? HTTPURLResponse else { return .failure(.decoding) }
+        if http.statusCode == 401 { return .failure(.unauthorized) }
+        guard (200...299).contains(http.statusCode) else {
+            let message = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error"] as? String
+            return .failure(.server(message ?? "Request failed (\(http.statusCode))."))
+        }
+        return .success(data)
     }
 
     private static func baseURL(from settings: AppSettings) -> URL? {

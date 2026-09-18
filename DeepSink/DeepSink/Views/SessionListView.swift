@@ -4,22 +4,22 @@
 //
 
 import SwiftUI
-import SwiftData
 
 struct SessionListView: View {
-    @Query(sort: \Session.startedAt, order: .reverse) private var sessions: [Session]
-    @Environment(\.modelContext) private var modelContext
+    @EnvironmentObject var settings: AppSettings
+    @EnvironmentObject var routerClient: RouterClient
+    @EnvironmentObject var sessionStore: DeepSinkSessionStore
 
     var body: some View {
         List {
-            if sessions.isEmpty {
+            if sessionStore.sessions.isEmpty {
                 ContentUnavailableView(
                     "No sessions yet",
                     systemImage: "waveform",
                     description: Text("Recordings you stop will show up here.")
                 )
             }
-            ForEach(sessions) { session in
+            ForEach(sessionStore.sessions) { session in
                 NavigationLink {
                     SessionDetailView(session: session)
                 } label: {
@@ -29,9 +29,12 @@ struct SessionListView: View {
             .onDelete(perform: delete)
         }
         .navigationTitle("Sessions")
+        .refreshable {
+            await sessionStore.refresh(settings: settings)
+        }
     }
 
-    private func row(for session: Session) -> some View {
+    private func row(for session: DeepSinkSession) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(session.title).font(.headline)
             HStack(spacing: 6) {
@@ -39,7 +42,7 @@ struct SessionListView: View {
                 Text("·")
                 Text(formattedDuration(session.durationSeconds))
                 Text("·")
-                Text(session.state.label)
+                Text(session.stageLabel)
                 if session.openActionItemCount > 0 {
                     Text("· \(session.openActionItemCount) open")
                 }
@@ -51,14 +54,11 @@ struct SessionListView: View {
     }
 
     private func delete(at offsets: IndexSet) {
-        for index in offsets {
-            let session = sessions[index]
-            for chunk in session.chunks {
-                try? FileManager.default.removeItem(at: AudioRecorder.audioDirectory.appendingPathComponent(chunk.fileName))
-            }
-            modelContext.delete(session)
+        let toDelete = offsets.map { sessionStore.sessions[$0] }
+        for session in toDelete {
+            sessionStore.remove(id: session.id)
+            Task { _ = await routerClient.deleteSession(id: session.id, settings: settings) }
         }
-        try? modelContext.save()
     }
 
     private func formattedDuration(_ seconds: Double) -> String {
@@ -69,8 +69,11 @@ struct SessionListView: View {
 }
 
 #Preview {
-    NavigationStack {
+    let router = RouterClient()
+    return NavigationStack {
         SessionListView()
     }
-    .modelContainer(for: [Session.self, ActionItem.self, Marker.self], inMemory: true)
+    .environmentObject(AppSettings())
+    .environmentObject(router)
+    .environmentObject(DeepSinkSessionStore(routerClient: router))
 }

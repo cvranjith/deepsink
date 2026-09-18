@@ -30,7 +30,7 @@ struct SettingsView: View {
             } header: {
                 Text("Router")
             } footer: {
-                Text("The same ai-router your other personal apps use. The token is stored in Keychain, never in plain settings — see the app's README for what deepsink.transcribe/deepsink.notes need added server-side.")
+                Text("The same ai-router your other personal apps use. The token is stored in Keychain, never in plain settings — sessions themselves live on the Mac mini, not on this phone.")
             }
 
             Section {
@@ -45,20 +45,6 @@ struct SettingsView: View {
                 Text("Recording")
             } footer: {
                 Text("Target length before a chunk is cut and uploaded — actual cuts happen a little after this, at the next quiet moment in the room.")
-            }
-
-            Section {
-                Stepper(value: $settings.deleteAudioAfterDays, in: 0...90, step: 1) {
-                    HStack {
-                        Text("Delete audio after")
-                        Spacer()
-                        Text(settings.deleteAudioAfterDays == 0 ? "Never" : "\(settings.deleteAudioAfterDays)d").foregroundStyle(.secondary)
-                    }
-                }
-            } header: {
-                Text("Storage")
-            } footer: {
-                Text("Audio is kept once a session is ready, then deleted automatically this many days later to save space. The transcript and notes are never deleted by this — only the audio files. Set to 0 to keep audio indefinitely.")
             }
 
             Section {

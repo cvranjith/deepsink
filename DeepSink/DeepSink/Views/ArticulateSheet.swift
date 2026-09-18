@@ -17,7 +17,7 @@ struct ArticulateSheet: View {
     // SessionDetailView) can go along with the transcript excerpt — nil
     // only in the (currently unreachable in practice) case of no active
     // session, in which case background notes are simply omitted.
-    let session: Session?
+    let session: DeepSinkSession?
 
     @EnvironmentObject var settings: AppSettings
     @EnvironmentObject var routerClient: RouterClient

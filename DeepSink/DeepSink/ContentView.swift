@@ -4,7 +4,6 @@
 //
 
 import SwiftUI
-import SwiftData
 import AVFoundation
 import UIKit
 
@@ -19,21 +18,31 @@ struct ContentView: View {
     @EnvironmentObject var settings: AppSettings
     @EnvironmentObject var audioRecorder: AudioRecorder
     @EnvironmentObject var liveAssistEngine: LiveAssistEngine
-    @EnvironmentObject var sessionProcessor: SessionProcessor
+    @EnvironmentObject var routerClient: RouterClient
+    @EnvironmentObject var sessionStore: DeepSinkSessionStore
     @StateObject private var networkMonitor = NetworkMonitor()
-    @Environment(\.modelContext) private var modelContext
     @Environment(\.scenePhase) private var scenePhase
-    @Query(sort: \Session.startedAt, order: .reverse) private var sessions: [Session]
 
-    @State private var activeSession: Session?
+    @State private var activeSession: DeepSinkSession?
     @State private var showReminderBanner = false
     @State private var showMarkerSheet = false
-    @State private var pendingMarker: Marker?
-    @State private var navigateToSessionID: UUID?
+    @State private var pendingMarkerOffset: Double?
+    @State private var navigateToSessionID: String?
     @State private var recordError: String?
     @State private var liveAssistError: String?
     @State private var attentionKeyword: String?
     @State private var showArticulateSheet = false
+
+    // Chunks upload to the server as soon as AudioRecorder finishes
+    // writing each one — not batched at Stop — so both of these track
+    // that in-flight work rather than anything about the recording
+    // itself: `uploadTasks` is awaited before Stop asks the server to
+    // finish the session (so the last chunk can't race the finish
+    // call), and `pendingChunkUploads` holds any chunk whose upload
+    // failed outright, retried the moment NetworkMonitor sees the
+    // connection come back.
+    @State private var uploadTasks: [Task<Void, Never>] = []
+    @State private var pendingChunkUploads: [(chunk: SessionChunk, sessionID: String)] = []
 
     // Capped rather than a true infinite-scroll page — this is a
     // personal app holding dozens of sessions, not thousands; "recent N
@@ -69,7 +78,7 @@ struct ContentView: View {
                 }
             }
             .navigationDestination(item: $navigateToSessionID) { id in
-                if let session = sessions.first(where: { $0.id == id }) {
+                if let session = sessionStore.session(id: id) {
                     SessionDetailView(session: session)
                 }
             }
@@ -84,8 +93,8 @@ struct ContentView: View {
                 recordButtonBar
             }
             .sheet(isPresented: $showMarkerSheet) {
-                if let pendingMarker {
-                    MarkerDetailSheet(marker: pendingMarker)
+                if let activeSession, let pendingMarkerOffset {
+                    MarkerDetailSheet(sessionID: activeSession.id, offsetSeconds: pendingMarkerOffset)
                 }
             }
             .sheet(isPresented: $showArticulateSheet) {
@@ -103,16 +112,15 @@ struct ContentView: View {
             }
         }
         .onAppear {
-            sessionProcessor.resumeAll(sessions: sessions, settings: settings, modelContext: modelContext)
-            sessionProcessor.purgeExpiredAudio(sessions: sessions, settings: settings)
+            Task { await sessionStore.refresh(settings: settings) }
             networkMonitor.start {
-                sessionProcessor.resumeAll(sessions: sessions, settings: settings, modelContext: modelContext)
+                retryPendingChunkUploads()
             }
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
-                sessionProcessor.resumeAll(sessions: sessions, settings: settings, modelContext: modelContext)
-                sessionProcessor.purgeExpiredAudio(sessions: sessions, settings: settings)
+                Task { await sessionStore.refresh(settings: settings) }
+                retryPendingChunkUploads()
             }
         }
     }
@@ -122,14 +130,14 @@ struct ContentView: View {
     private var homeContent: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                if sessions.isEmpty {
+                if sessionStore.sessions.isEmpty {
                     emptyState
                 } else {
                     Text("Recent")
                         .font(.title3.bold())
                         .padding(.horizontal)
                         .padding(.top, 8)
-                    ForEach(sessions.prefix(Self.recentSessionLimit)) { session in
+                    ForEach(sessionStore.sessions.prefix(Self.recentSessionLimit)) { session in
                         NavigationLink {
                             SessionDetailView(session: session)
                         } label: {
@@ -138,11 +146,11 @@ struct ContentView: View {
                         .buttonStyle(.plain)
                         .padding(.horizontal)
                     }
-                    if sessions.count > Self.recentSessionLimit {
+                    if sessionStore.sessions.count > Self.recentSessionLimit {
                         NavigationLink {
                             SessionListView()
                         } label: {
-                            Text("See all \(sessions.count) sessions")
+                            Text("See all \(sessionStore.sessions.count) sessions")
                                 .font(.subheadline.weight(.semibold))
                                 .frame(maxWidth: .infinity)
                                 .padding(.vertical, 10)
@@ -203,7 +211,7 @@ struct ContentView: View {
                 } else {
                     // Rough on-device recognition, not the final transcript
                     // — replaced by the accurate Whisper-transcribed text
-                    // once this session finishes processing after Stop.
+                    // as chunks upload and the server transcribes each one.
                     Text(liveAssistEngine.livePreviewText)
                 }
             }
@@ -317,34 +325,31 @@ struct ContentView: View {
                 return
             }
 
-            let session = Session(title: Session.defaultTitle(for: Date()), startedAt: Date())
-            modelContext.insert(session)
-            do {
-                try modelContext.save()
-            } catch {
-                // Surfaced rather than swallowed (`try?`) on purpose: a
-                // failure here means the session that's about to record
-                // was never actually persisted — silently starting the
-                // recorder anyway is exactly how a real recording once
-                // ended up with a saved audio file and no Session to show
-                // for it (see Session.swift's own comment on the
-                // migration bug this traces back to). Better to refuse to
-                // start than to record into the void again.
-                recordError = "Couldn't save the new session: \(error.localizedDescription)"
-                modelContext.delete(session)
+            let title = DeepSinkSession.defaultTitle(for: Date())
+            let created = await routerClient.createSession(title: title, settings: settings)
+            let session: DeepSinkSession
+            switch created {
+            case .success(let value):
+                session = value
+            case .failure(let error):
+                recordError = "Couldn't start a session on the server: \(error.message)"
                 return
             }
+            sessionStore.apply(session)
             activeSession = session
+            uploadTasks = []
+            pendingChunkUploads = []
 
             audioRecorder.targetChunkSeconds = TimeInterval(settings.chunkTargetSeconds)
             audioRecorder.maxChunkSeconds = TimeInterval(settings.chunkTargetSeconds + 30)
 
             do {
-                try audioRecorder.start(sessionID: session.id) { chunk in
-                    var chunks = session.chunks
-                    chunks.append(chunk)
-                    session.chunks = chunks
-                    try? modelContext.save()
+                // AudioRecorder's own sessionID is only ever used locally
+                // to name chunk files — it doesn't need to (and, since
+                // it's typed as UUID while server session ids are plain
+                // strings, can't) match the server session's id.
+                try audioRecorder.start(sessionID: UUID()) { [sessionID = session.id] chunk in
+                    uploadChunk(chunk, sessionID: sessionID)
                 }
                 if settings.announceRecordingReminder {
                     withAnimation { showReminderBanner = true }
@@ -358,9 +363,9 @@ struct ContentView: View {
                 }
             } catch {
                 recordError = "Couldn't start recording: \(error.localizedDescription)"
-                modelContext.delete(session)
-                try? modelContext.save()
                 activeSession = nil
+                sessionStore.remove(id: session.id)
+                Task { _ = await routerClient.deleteSession(id: session.id, settings: settings) }
             }
         }
     }
@@ -404,28 +409,97 @@ struct ContentView: View {
         }
     }
 
+    // Uploads a just-finished chunk immediately rather than batching it
+    // for later — every write endpoint returns the full, current
+    // session, so applying that response as each chunk lands is what
+    // makes the "transcript fills in live" behavior work, on the phone
+    // and on any other client (e.g. the Mac mini itself) watching the
+    // same session.
+    private func uploadChunk(_ chunk: SessionChunk, sessionID: String) {
+        let task = Task {
+            await performChunkUpload(chunk, sessionID: sessionID)
+        }
+        uploadTasks.append(task)
+    }
+
+    private func performChunkUpload(_ chunk: SessionChunk, sessionID: String) async {
+        let url = AudioRecorder.audioDirectory.appendingPathComponent(chunk.fileName)
+        guard let data = try? Data(contentsOf: url) else {
+            // Nothing to retry — the file itself is gone.
+            return
+        }
+        let result = await routerClient.uploadChunk(
+            sessionID: sessionID,
+            chunkIndex: chunk.index,
+            startOffsetSeconds: chunk.startOffsetSeconds,
+            durationSeconds: chunk.durationSeconds,
+            audioData: data,
+            settings: settings
+        )
+        switch result {
+        case .success(let session):
+            sessionStore.apply(session)
+            if activeSession?.id == session.id {
+                activeSession = session
+            }
+            try? FileManager.default.removeItem(at: url)
+        case .failure:
+            pendingChunkUploads.append((chunk, sessionID))
+        }
+    }
+
+    private func retryPendingChunkUploads() {
+        guard !pendingChunkUploads.isEmpty else { return }
+        let pending = pendingChunkUploads
+        pendingChunkUploads = []
+        for (chunk, sessionID) in pending {
+            uploadChunk(chunk, sessionID: sessionID)
+        }
+    }
+
     private func stopRecording() {
         guard let session = activeSession else { return }
         audioRecorder.stop()
         liveAssistEngine.stop()
         attentionKeyword = nil
-        session.durationSeconds = audioRecorder.elapsedSeconds
-        session.recordingIncomplete = audioRecorder.recordingIncomplete
-        session.state = ProcessingState(stage: .uploading, chunksDone: 0, chunksTotal: session.chunks.count, failureReason: nil)
-        try? modelContext.save()
-        sessionProcessor.process(session: session, settings: settings, modelContext: modelContext)
+        let sessionID = session.id
+        let duration = audioRecorder.elapsedSeconds
+        let incomplete = audioRecorder.recordingIncomplete
         activeSession = nil
-        navigateToSessionID = session.id
+        navigateToSessionID = sessionID
+
+        Task {
+            // Let every chunk still uploading land before asking the
+            // server to finish — the last chunk is finalized
+            // synchronously by audioRecorder.stop() above, but uploaded
+            // via a fire-and-forget Task, so without this a `finish`
+            // call could race ahead of it and generate notes from a
+            // transcript still missing that tail.
+            for task in uploadTasks { await task.value }
+            uploadTasks = []
+
+            if case .success(let updated) = await routerClient.updateSession(
+                id: sessionID,
+                fields: ["duration_seconds": duration, "recording_incomplete": incomplete],
+                settings: settings
+            ) {
+                sessionStore.apply(updated)
+            }
+
+            let result = await routerClient.finishSession(id: sessionID, settings: settings)
+            switch result {
+            case .success(let finished):
+                sessionStore.apply(finished)
+            case .failure(let error):
+                recordError = "Couldn't finish processing: \(error.message)"
+                await sessionStore.refresh(settings: settings)
+            }
+        }
     }
 
     private func markMoment() {
-        guard let session = activeSession else { return }
-        let marker = Marker(offsetSeconds: audioRecorder.elapsedSeconds)
-        modelContext.insert(marker)
-        marker.session = session
-        session.markers.append(marker)
-        try? modelContext.save()
-        pendingMarker = marker
+        guard activeSession != nil else { return }
+        pendingMarkerOffset = audioRecorder.elapsedSeconds
         showMarkerSheet = true
     }
 
@@ -437,11 +511,11 @@ struct ContentView: View {
 }
 
 #Preview {
-    ContentView()
+    let router = RouterClient()
+    return ContentView()
         .environmentObject(AppSettings())
         .environmentObject(AudioRecorder())
         .environmentObject(LiveAssistEngine())
-        .environmentObject(RouterClient())
-        .environmentObject(SessionProcessor(routerClient: RouterClient()))
-        .modelContainer(for: [Session.self, ActionItem.self, Marker.self], inMemory: true)
+        .environmentObject(router)
+        .environmentObject(DeepSinkSessionStore(routerClient: router))
 }

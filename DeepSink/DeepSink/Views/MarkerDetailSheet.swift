@@ -4,19 +4,27 @@
 //
 
 import SwiftUI
-import PhotosUI
-import SwiftData
 
-// The marker itself is already saved the instant "Mark this moment" is
-// tapped (see ContentView.markMoment) — this sheet only ever adds an
-// optional comment/photo afterward, non-blocking, matching FR-8: "no
-// typing" for the capture itself, since the user may be mid-conversation.
+// Shown right after "Mark this moment" is tapped. Unlike the old
+// SwiftData version, there's no local Marker created up front to attach
+// a comment to afterward — the server's marker endpoint creates and
+// comments in one call, so nothing is persisted until "Done" here. That
+// means dismissing the app before tapping Done loses the marker
+// entirely, a real (if narrow) behavior change from "saved the instant
+// you tap the bookmark," accepted since there's no separate create-then-
+// patch pair to call instead. Photo attachment is dropped too: the
+// server has no marker-photo upload endpoint.
 struct MarkerDetailSheet: View {
-    @Bindable var marker: Marker
-    @Environment(\.modelContext) private var modelContext
+    let sessionID: String
+    let offsetSeconds: Double
+
+    @EnvironmentObject var settings: AppSettings
+    @EnvironmentObject var routerClient: RouterClient
+    @EnvironmentObject var sessionStore: DeepSinkSessionStore
     @Environment(\.dismiss) private var dismiss
+
     @State private var comment: String = ""
-    @State private var photoItem: PhotosPickerItem?
+    @State private var isSaving = false
 
     var body: some View {
         NavigationStack {
@@ -27,42 +35,34 @@ struct MarkerDetailSheet: View {
                         DictationButton(text: $comment)
                     }
                 }
-                Section("Photo (optional)") {
-                    PhotosPicker("Attach a photo", selection: $photoItem, matching: .images)
-                    if marker.photoFileName != nil {
-                        Label("Photo attached", systemImage: "checkmark.circle.fill")
-                            .foregroundStyle(.green)
-                            .font(.caption)
-                    }
-                }
             }
             .navigationTitle("Moment Marked")
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { save() }
+                    Button {
+                        Task { await save() }
+                    } label: {
+                        if isSaving { ProgressView() } else { Text("Done") }
+                    }
+                    .disabled(isSaving)
                 }
-            }
-            .onAppear { comment = marker.comment ?? "" }
-            .onChange(of: photoItem) { _, newItem in
-                Task { await attachPhoto(newItem) }
             }
         }
     }
 
-    private func attachPhoto(_ item: PhotosPickerItem?) async {
-        guard let item, let data = try? await item.loadTransferable(type: Data.self) else { return }
-        let markersDirectory = AudioRecorder.audioDirectory
-            .deletingLastPathComponent()
-            .appendingPathComponent("Markers", isDirectory: true)
-        try? FileManager.default.createDirectory(at: markersDirectory, withIntermediateDirectories: true)
-        let fileName = "\(marker.id.uuidString).jpg"
-        try? data.write(to: markersDirectory.appendingPathComponent(fileName))
-        marker.photoFileName = fileName
-    }
-
-    private func save() {
-        marker.comment = comment.trimmingCharacters(in: .whitespacesAndNewlines)
-        try? modelContext.save()
+    private func save() async {
+        isSaving = true
+        let trimmed = comment.trimmingCharacters(in: .whitespacesAndNewlines)
+        let result = await routerClient.addMarker(
+            sessionID: sessionID,
+            offsetSeconds: offsetSeconds,
+            comment: trimmed.isEmpty ? nil : trimmed,
+            settings: settings
+        )
+        if case .success(let session) = result {
+            sessionStore.apply(session)
+        }
+        isSaving = false
         dismiss()
     }
 }

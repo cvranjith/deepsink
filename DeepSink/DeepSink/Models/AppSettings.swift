@@ -14,7 +14,6 @@ final class AppSettings: ObservableObject {
     private enum Keys {
         static let routerURL = "routerURL"
         static let chunkTargetSeconds = "chunkTargetSeconds"
-        static let deleteAudioAfterDays = "deleteAudioAfterDays"
         static let announceRecordingReminder = "announceRecordingReminder"
         static let liveAssistEnabled = "liveAssistEnabled"
         static let attentionKeywords = "attentionKeywords"
@@ -31,7 +30,6 @@ final class AppSettings: ObservableObject {
         // in AudioRecorder waiting too long past it; short enough that a
         // failed upload only ever has to redo a few minutes of audio.
         static let chunkTargetSeconds = 180
-        static let deleteAudioAfterDays = 7
         // 3 minutes — long enough to catch a question asked a little
         // before you tuned back in, short enough that Articulate's
         // answer stays focused and the model call stays fast.
@@ -51,13 +49,6 @@ final class AppSettings: ObservableObject {
     // logic. Exposed per FR-7 ("cheap to expose").
     @Published var chunkTargetSeconds: Int {
         didSet { UserDefaults.standard.set(chunkTargetSeconds, forKey: Keys.chunkTargetSeconds) }
-    }
-
-    // Days after a session reaches `.ready` before its audio chunks are
-    // deleted automatically — 0 means keep indefinitely. See
-    // SessionProcessor.purgeExpiredAudio.
-    @Published var deleteAudioAfterDays: Int {
-        didSet { UserDefaults.standard.set(deleteAudioAfterDays, forKey: Keys.deleteAudioAfterDays) }
     }
 
     // Section 5's consent nudge — an on-screen reminder shown the moment
@@ -92,7 +83,6 @@ final class AppSettings: ObservableObject {
         self.routerURL = defaults.string(forKey: Keys.routerURL) ?? ""
         self.routerToken = KeychainStore.read(account: KeychainAccounts.routerToken) ?? ""
         self.chunkTargetSeconds = defaults.object(forKey: Keys.chunkTargetSeconds) as? Int ?? Defaults.chunkTargetSeconds
-        self.deleteAudioAfterDays = defaults.object(forKey: Keys.deleteAudioAfterDays) as? Int ?? Defaults.deleteAudioAfterDays
         self.announceRecordingReminder = defaults.object(forKey: Keys.announceRecordingReminder) as? Bool ?? true
         self.liveAssistEnabled = defaults.bool(forKey: Keys.liveAssistEnabled)
         self.attentionKeywords = defaults.stringArray(forKey: Keys.attentionKeywords) ?? []

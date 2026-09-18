@@ -4,7 +4,6 @@
 //
 
 import SwiftUI
-import SwiftData
 
 @main
 struct DeepSinkApp: App {
@@ -12,12 +11,12 @@ struct DeepSinkApp: App {
     @StateObject private var audioRecorder = AudioRecorder()
     @StateObject private var liveAssistEngine = LiveAssistEngine()
     @StateObject private var routerClient: RouterClient
-    @StateObject private var sessionProcessor: SessionProcessor
+    @StateObject private var sessionStore: DeepSinkSessionStore
 
     init() {
         let router = RouterClient()
         _routerClient = StateObject(wrappedValue: router)
-        _sessionProcessor = StateObject(wrappedValue: SessionProcessor(routerClient: router))
+        _sessionStore = StateObject(wrappedValue: DeepSinkSessionStore(routerClient: router))
     }
 
     var body: some Scene {
@@ -27,12 +26,11 @@ struct DeepSinkApp: App {
                 .environmentObject(audioRecorder)
                 .environmentObject(liveAssistEngine)
                 .environmentObject(routerClient)
-                .environmentObject(sessionProcessor)
+                .environmentObject(sessionStore)
         }
-        // Attaches a SwiftData store for these models to the whole view
-        // hierarchy — any view below this can read/write via `@Query` and
-        // `@Environment(\.modelContext)` without being handed anything
-        // explicitly. Same pattern as yt-run's YTRunApp.
-        .modelContainer(for: [Session.self, ActionItem.self, Marker.self])
+        // No .modelContainer anymore — the server is the only store of
+        // session data now (see DeepSinkSession's doc comment); sessionStore
+        // is just an in-memory cache of the server's list, refreshed on
+        // demand rather than attached as a persistence layer.
     }
 }

@@ -11,7 +11,7 @@ import SwiftUI
 // comparable apps rather than this app's original single-button empty
 // screen.
 struct SessionCard: View {
-    let session: Session
+    let session: DeepSinkSession
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -48,21 +48,13 @@ struct SessionCard: View {
     }
 
     private var stateBadge: some View {
-        Text(session.state.label)
+        Text(session.stageLabel)
             .font(.caption2.weight(.semibold))
             .lineLimit(1)
             .padding(.horizontal, 8)
             .padding(.vertical, 3)
-            .background(stateColor.opacity(0.15), in: Capsule())
-            .foregroundStyle(stateColor)
-    }
-
-    private var stateColor: Color {
-        switch session.state.stage {
-        case .ready: return .green
-        case .failed: return .red
-        default: return .secondary
-        }
+            .background(session.stageColor.opacity(0.15), in: Capsule())
+            .foregroundStyle(session.stageColor)
     }
 
     private func formattedDuration(_ seconds: Double) -> String {
