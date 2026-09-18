@@ -8,11 +8,13 @@ import SwiftData
 import AVFoundation
 import UIKit
 
-// The root screen IS the record screen — FR-1 asks for "a big,
-// unambiguous record/stop control... I will be tapping this at the
-// start of a meeting while distracted," so nothing is allowed to sit in
-// front of it. Everything else (sessions, settings, and — tucked further
-// still — the update mechanism) lives one tap away via the toolbar.
+// Home screen: recent sessions as cards up top, a compact record control
+// pinned to the bottom via `.safeAreaInset` so it's always reachable
+// regardless of scroll position or which state (browsing vs. recording)
+// is showing above it. Originally just one big centered record button on
+// an otherwise empty screen — redesigned after seeing how comparable
+// apps (Voicenotes, Otter-style tools) lay this out: recent items are
+// the useful thing to land on, not an empty circle.
 struct ContentView: View {
     @EnvironmentObject var settings: AppSettings
     @EnvironmentObject var audioRecorder: AudioRecorder
@@ -32,22 +34,22 @@ struct ContentView: View {
     @State private var attentionKeyword: String?
     @State private var showArticulateSheet = false
 
+    // Capped rather than a true infinite-scroll page — this is a
+    // personal app holding dozens of sessions, not thousands; "recent N
+    // plus a link to the full list" gets the "don't clutter home with
+    // everything" ask without building real pagination for a list this
+    // size.
+    private static let recentSessionLimit = 5
+
     var body: some View {
         NavigationStack {
-            VStack(spacing: 28) {
-                Spacer()
-                statusText
-                recordButton
+            Group {
                 if audioRecorder.isRecording {
-                    levelMeter
-                    markMomentButton
-                    if settings.liveAssistEnabled {
-                        articulateButton
-                    }
+                    recordingPanel
+                } else {
+                    homeContent
                 }
-                Spacer()
             }
-            .padding()
             .navigationTitle("DeepSink")
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
@@ -76,6 +78,9 @@ struct ContentView: View {
                 } else if let attentionKeyword {
                     attentionBanner(for: attentionKeyword)
                 }
+            }
+            .safeAreaInset(edge: .bottom) {
+                recordButtonBar
             }
             .sheet(isPresented: $showMarkerSheet) {
                 if let pendingMarker {
@@ -106,25 +111,121 @@ struct ContentView: View {
         }
     }
 
-    private var statusText: some View {
-        Group {
-            if audioRecorder.isRecording {
-                Text(formattedElapsed(audioRecorder.elapsedSeconds))
-                    .font(.system(size: 56, weight: .semibold, design: .rounded))
-                    .monospacedDigit()
-            } else {
-                Text("Ready to record")
-                    .font(.title3)
-                    .foregroundStyle(.secondary)
+    // MARK: - Home (not recording)
+
+    private var homeContent: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                if sessions.isEmpty {
+                    emptyState
+                } else {
+                    Text("Recent")
+                        .font(.title3.bold())
+                        .padding(.horizontal)
+                        .padding(.top, 8)
+                    ForEach(sessions.prefix(Self.recentSessionLimit)) { session in
+                        NavigationLink {
+                            SessionDetailView(session: session)
+                        } label: {
+                            SessionCard(session: session)
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.horizontal)
+                    }
+                    if sessions.count > Self.recentSessionLimit {
+                        NavigationLink {
+                            SessionListView()
+                        } label: {
+                            Text("See all \(sessions.count) sessions")
+                                .font(.subheadline.weight(.semibold))
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 10)
+                        }
+                        .buttonStyle(.bordered)
+                        .padding(.horizontal)
+                    }
+                }
             }
+            .padding(.bottom, 100)
         }
+    }
+
+    private var emptyState: some View {
+        ContentUnavailableView(
+            "Ready to record",
+            systemImage: "waveform",
+            description: Text("Tap the record button below to capture your first meeting.")
+        )
+        .padding(.top, 60)
+    }
+
+    // MARK: - Recording
+
+    private var recordingPanel: some View {
+        ScrollView {
+            VStack(spacing: 20) {
+                Text(formattedElapsed(audioRecorder.elapsedSeconds))
+                    .font(.system(size: 48, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                    .padding(.top, 12)
+                levelMeter
+                livePreviewSection
+                HStack(spacing: 12) {
+                    markMomentButton
+                    if settings.liveAssistEnabled {
+                        articulateButton
+                    }
+                }
+            }
+            .padding(.horizontal)
+            .padding(.bottom, 100)
+        }
+    }
+
+    private var livePreviewSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("Live preview", systemImage: "waveform.badge.mic")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            Group {
+                if !settings.liveAssistEnabled {
+                    Text("Turn on Live Assist in Settings for a live, on-device preview of what's being said.")
+                        .foregroundStyle(.secondary)
+                } else if liveAssistEngine.livePreviewText.isEmpty {
+                    Text("Listening…")
+                        .foregroundStyle(.secondary)
+                } else {
+                    // Rough on-device recognition, not the final transcript
+                    // — replaced by the accurate Whisper-transcribed text
+                    // once this session finishes processing after Stop.
+                    Text(liveAssistEngine.livePreviewText)
+                }
+            }
+            .font(.subheadline)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, minHeight: 120, alignment: .topLeading)
+        .background(.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+    }
+
+    // MARK: - Shared controls
+
+    private var recordButtonBar: some View {
+        HStack {
+            Spacer()
+            recordButton
+            Spacer()
+        }
+        .padding(.vertical, 10)
+        .background(.bar)
     }
 
     private var recordButton: some View {
         Button(action: toggleRecording) {
             Image(systemName: audioRecorder.isRecording ? "stop.circle.fill" : "record.circle.fill")
                 .resizable()
-                .frame(width: 120, height: 120)
+                .frame(width: 72, height: 72)
                 .foregroundStyle(audioRecorder.isRecording ? Color.red : Color.red.opacity(0.85))
         }
         .buttonStyle(.plain)
@@ -142,7 +243,7 @@ struct ContentView: View {
                 }
         }
         .frame(height: 10)
-        .padding(.horizontal, 40)
+        .padding(.horizontal, 20)
     }
 
     private var markMomentButton: some View {

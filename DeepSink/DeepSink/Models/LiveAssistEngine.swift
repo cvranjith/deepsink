@@ -53,6 +53,16 @@ final class LiveAssistEngine: ObservableObject {
     private(set) var isRunning = false
     var onKeywordDetected: ((String) -> Void)?
 
+    // A rolling window of recognized text for the recording screen's
+    // "live preview" (see ContentView) — same underlying buffer
+    // `recentTranscript(seconds:)` reads on demand for Articulate, just
+    // kept published so a view can show it updating in real time instead
+    // of polling. Deliberately labelled as rough/on-device in the UI:
+    // this is Apple's live recognizer, not the Whisper transcript that
+    // eventually replaces it once the session is processed.
+    @Published private(set) var livePreviewText = ""
+    private static let livePreviewWindowSeconds: TimeInterval = 120
+
     // Not because on-device recognition tasks are documented to have a
     // hard duration cap (that limit was specifically for server-based
     // recognition) — a periodic restart is cheap insurance against any
@@ -86,6 +96,7 @@ final class LiveAssistEngine: ObservableObject {
         self.keywords = keywords
         sessionStartDate = Date()
         buffer.reset()
+        livePreviewText = ""
 
         let inputNode = engine.inputNode
         let format = inputNode.outputFormat(forBus: 0)
@@ -121,6 +132,7 @@ final class LiveAssistEngine: ObservableObject {
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
         isRunning = false
+        livePreviewText = ""
     }
 
     func updateKeywords(_ keywords: [String]) {
@@ -162,6 +174,7 @@ final class LiveAssistEngine: ObservableObject {
             let text = result.bestTranscription.formattedString
             let elapsed = Date().timeIntervalSince(sessionStartDate)
             buffer.updateCurrentUtterance(text: text, offsetSeconds: elapsed)
+            livePreviewText = buffer.recentText(seconds: Self.livePreviewWindowSeconds, currentOffset: elapsed)
             checkKeywords(in: text)
             if result.isFinal {
                 buffer.finishUtterance()
