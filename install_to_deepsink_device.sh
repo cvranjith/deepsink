@@ -73,7 +73,15 @@ xcrun devicectl list devices --json-output "$DEVICES_JSON" --omit-deprecated-fie
 # pairing record for the device at all — any *targeted* devicectl operation
 # against a paired device's UDID (an actual build/install, same as the one
 # below) transparently re-establishes the tunnel on demand.
-DEVICE_ID=$(jq -r '[.result.devices[] | select(.properties.connection.pairingState == "paired")][0].properties.hardware.udid // empty' "$DEVICES_JSON")
+#
+# Also filters on `hardware.reality == "physical"` — on this Xcode version
+# a Simulator device can report `pairingState: "paired"` too (there's no
+# real pairing concept for it, but the field isn't just absent), so
+# pairingState alone isn't enough to exclude simulators. Without this, a
+# simulator sorting before the real device in `list devices`' output gets
+# picked instead, and the resulting build silently targets the Simulator
+# SDK rather than the actual phone.
+DEVICE_ID=$(jq -r '[.result.devices[] | select(.properties.connection.pairingState == "paired" and .properties.hardware.reality == "physical")][0].properties.hardware.udid // empty' "$DEVICES_JSON")
 if [ -z "$DEVICE_ID" ]; then
   echo "No paired device found. Plug in your iPhone via USB and unlock it, or pair it once over USB for future Wi-Fi use." >&2
   exit 1
