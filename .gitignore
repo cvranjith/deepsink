@@ -1,0 +1,13 @@
+# Xcode
+DeepSink/build/
+DeepSink/DerivedData/
+*.xcuserstate
+*.xcuserdatad/
+xcuserdata/
+.DS_Store
+
+# Nothing else needed: no Secrets.swift-style file exists — the router URL
+# and bearer token are entered in-app (Settings) and live in UserDefaults/
+# Keychain on-device, never in source. This is what keeps the repo itself
+# fully sufficient to clone-and-build on a different Mac (see
+# install_to_deepsink_device.sh's own comment on statelessness).
