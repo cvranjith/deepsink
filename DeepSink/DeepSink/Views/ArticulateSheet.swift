@@ -13,6 +13,12 @@ import SwiftUI
 // read out loud (not spoken by the phone itself — reading it out loud in
 // a live meeting is the point).
 struct ArticulateSheet: View {
+    // The in-progress session, so its background notes (see
+    // SessionDetailView) can go along with the transcript excerpt — nil
+    // only in the (currently unreachable in practice) case of no active
+    // session, in which case background notes are simply omitted.
+    let session: Session?
+
     @EnvironmentObject var settings: AppSettings
     @EnvironmentObject var routerClient: RouterClient
     @EnvironmentObject var liveAssistEngine: LiveAssistEngine
@@ -79,7 +85,7 @@ struct ArticulateSheet: View {
             return
         }
 
-        let result = await routerClient.articulate(recentTranscript: transcript, settings: settings)
+        let result = await routerClient.articulate(recentTranscript: transcript, backgroundNotes: session?.backgroundNotes ?? "", settings: settings)
         isLoading = false
         switch result {
         case .success(let payload):

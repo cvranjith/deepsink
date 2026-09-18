@@ -83,7 +83,7 @@ struct ContentView: View {
                 }
             }
             .sheet(isPresented: $showArticulateSheet) {
-                ArticulateSheet()
+                ArticulateSheet(session: activeSession)
             }
             .alert("Recording", isPresented: Binding(get: { recordError != nil }, set: { if !$0 { recordError = nil } })) {
                 Button("OK", role: .cancel) {}

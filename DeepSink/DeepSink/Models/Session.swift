@@ -13,6 +13,15 @@ final class Session {
     var startedAt: Date
     var durationSeconds: Double
 
+    // Free-text context the user adds about the meeting — who's in the
+    // room, the agenda, acronyms, prior history — sent alongside the
+    // transcript to both deepsink.notes and deepsink.articulate so
+    // generated notes/answers can use it, without it ever being treated
+    // as meeting content itself. Plain stored property (not a computed
+    // JSON-blob one like `notes`/`speakers`) since it's simple text a
+    // user edits directly, not a structured payload from the router.
+    var backgroundNotes: String
+
     // Set the moment an interruption (call, Siri, another app) steals
     // the mic mid-recording — see AudioRecorder's interruption handling.
     // FR-1 requires recording that fact rather than silently dropping
@@ -62,6 +71,7 @@ final class Session {
         self.title = title
         self.startedAt = startedAt
         self.durationSeconds = 0
+        self.backgroundNotes = ""
         self.recordingIncomplete = false
         self.stageRaw = ProcessingStage.recording.rawValue
         self.chunksDone = 0

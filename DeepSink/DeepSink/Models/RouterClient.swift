@@ -129,6 +129,7 @@ final class RouterClient: ObservableObject {
     func generateNotes(
         transcript: String,
         markers: [Marker],
+        backgroundNotes: String,
         settings: AppSettings
     ) async -> Result<SessionNotesPayload, RouterError> {
         let markerHints = markers
@@ -137,7 +138,7 @@ final class RouterClient: ObservableObject {
         let result = await invoke(
             service: "deepsink.notes",
             input: transcript,
-            options: ["marker_hints": markerHints],
+            options: ["marker_hints": markerHints, "background_notes": backgroundNotes],
             settings: settings,
             timeout: 120
         )
@@ -160,8 +161,8 @@ final class RouterClient: ObservableObject {
     // timeout for the same reason the deploy calls do — see that MARK's
     // comment for the measured Funnel latency this needs to absorb, on
     // top of however long Codex itself takes.
-    func articulate(recentTranscript: String, settings: AppSettings) async -> Result<ArticulateResponse, RouterError> {
-        let result = await invoke(service: "deepsink.articulate", input: recentTranscript, options: [:], settings: settings, timeout: 100)
+    func articulate(recentTranscript: String, backgroundNotes: String, settings: AppSettings) async -> Result<ArticulateResponse, RouterError> {
+        let result = await invoke(service: "deepsink.articulate", input: recentTranscript, options: ["background_notes": backgroundNotes], settings: settings, timeout: 100)
         switch result {
         case .success(let json):
             guard let data = try? JSONSerialization.data(withJSONObject: json),

@@ -173,7 +173,7 @@ final class SessionProcessor: ObservableObject {
         // than guessed at.
         let previouslyChecked = Set(session.actionItems.filter(\.isChecked).map(\.text))
 
-        let result = await routerClient.generateNotes(transcript: session.fullTranscript, markers: session.markers, settings: settings)
+        let result = await routerClient.generateNotes(transcript: session.fullTranscript, markers: session.markers, backgroundNotes: session.backgroundNotes, settings: settings)
         switch result {
         case .success(let payload):
             if let title = payload.title, !title.isEmpty {

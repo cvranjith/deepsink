@@ -87,7 +87,10 @@ POST /v1/invoke
 {
   "service": "deepsink.notes",
   "input": "<full transcript text>",
-  "options": { "marker_hints": [ { "offset_seconds": 812.0, "comment": "…" }, ... ] }
+  "options": {
+    "marker_hints": [ { "offset_seconds": 812.0, "comment": "…" }, ... ],
+    "background_notes": "<user-typed context about the session — see Session.backgroundNotes>"
+  }
 }
 200 -> { "output": {
   "title": "…", "summary": "…", "key_points": ["…"], "decisions": ["…"],
@@ -104,7 +107,11 @@ response degrades gracefully rather than failing to decode.
 
 ```
 POST /v1/invoke
-{ "service": "deepsink.articulate", "input": "<short, recent transcript excerpt>" }
+{
+  "service": "deepsink.articulate",
+  "input": "<short, recent transcript excerpt>",
+  "options": { "background_notes": "<same field as deepsink.notes>" }
+}
 200 -> { "output": { "bullets": ["…", …], "speech": "…" } }
 ```
 
@@ -112,6 +119,21 @@ Powers Live Assist's Articulate button (see below) — `input` is not the
 full session transcript, just the last few minutes from
 `LiveAssistEngine`'s on-device recognition. Tuned to be fast (tapped
 mid-meeting, waited on) rather than thorough.
+
+### Background notes
+
+`Session.backgroundNotes` (edited freely in `SessionDetailView`, any time
+— before, during, or after a session) is free-text context: who's in the
+room, the agenda, acronyms/jargon, prior history. Sent to both
+`deepsink.notes` and `deepsink.articulate` so generated notes and
+in-meeting answers can use it, but the prompt on both services explicitly
+tells the model it's background, not something that was actually said —
+so it informs interpretation without leaking into the summary or key
+points as if it were meeting content. Verified directly: the same
+question ("what's the status on the QBR prep") produced a generic answer
+without background notes and a specific, correct first-person answer
+("I've got the revenue slide...") once background notes named the
+user's own responsibility.
 
 ### `local.deploy`
 

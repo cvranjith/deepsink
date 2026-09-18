@@ -16,6 +16,7 @@ struct SessionDetailView: View {
     @State private var isEditingTitle = false
     @State private var isSharing = false
     @State private var shareText = ""
+    @FocusState private var isNotesFocused: Bool
 
     var body: some View {
         List {
@@ -53,6 +54,26 @@ struct SessionDetailView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+            }
+
+            Section {
+                TextEditor(text: $session.backgroundNotes)
+                    .frame(minHeight: 80)
+                    .focused($isNotesFocused)
+                    .onChange(of: isNotesFocused) { wasFocused, isFocused in
+                        // Saved on losing focus rather than per keystroke
+                        // (a TextEditor has no return-key "commit" the way
+                        // the title field's onCommit does, since newlines
+                        // are legitimate input here) — same "settle, then
+                        // persist" idea, just keyed off focus instead.
+                        if wasFocused, !isFocused {
+                            try? modelContext.save()
+                        }
+                    }
+            } header: {
+                Text("Notes")
+            } footer: {
+                Text("Background info — who's in the room, the agenda, acronyms, prior context. Sent along with the transcript when generating notes or an Articulate answer, but never treated as something that was said.")
             }
 
             if let summary = session.notes?.summary, !summary.isEmpty {
