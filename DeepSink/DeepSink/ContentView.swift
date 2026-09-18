@@ -31,6 +31,7 @@ struct ContentView: View {
     @State private var pendingMarker: Marker?
     @State private var navigateToSessionID: UUID?
     @State private var recordError: String?
+    @State private var liveAssistError: String?
     @State private var attentionKeyword: String?
     @State private var showArticulateSheet = false
 
@@ -94,6 +95,11 @@ struct ContentView: View {
                 Button("OK", role: .cancel) {}
             } message: {
                 Text(recordError ?? "")
+            }
+            .alert("Live Assist", isPresented: Binding(get: { liveAssistError != nil }, set: { if !$0 { liveAssistError = nil } })) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(liveAssistError ?? "")
             }
         }
         .onAppear {
@@ -360,20 +366,31 @@ struct ContentView: View {
     }
 
     // Live Assist failing to start (permission denied, recognizer
-    // unavailable) never blocks or interrupts the actual recording — it's
-    // an opt-in augmentation, not core functionality, per the original
-    // "if I'm not attending with full attention" framing. It just quietly
-    // doesn't run; the record/stop control and everything phase-1 already
-    // does are unaffected either way.
+    // unavailable, or the second AVAudioEngine failing to start while
+    // AudioRecorder already has the mic — the flagged-but-unverified risk
+    // from when this was built) never blocks or interrupts the actual
+    // recording — it's an opt-in augmentation, not core functionality,
+    // per the original "if I'm not attending with full attention"
+    // framing. But a silent failure here previously meant the live
+    // preview just stayed empty with zero indication why — `liveAssistError`
+    // surfaces it as an informational alert instead, while still leaving
+    // the recording itself completely unaffected either way.
     private func startLiveAssistIfPossible() async {
         let authorized = await LiveAssistEngine.requestAuthorizationIfNeeded()
-        guard authorized else { return }
+        guard authorized else {
+            liveAssistError = LiveAssistError.notAuthorized.message
+            return
+        }
         liveAssistEngine.onKeywordDetected = { keyword in
             Task { @MainActor in
                 showAttentionAlert(for: keyword)
             }
         }
-        try? liveAssistEngine.start(keywords: settings.attentionKeywords)
+        do {
+            try liveAssistEngine.start(keywords: settings.attentionKeywords)
+        } catch {
+            liveAssistError = "Live Assist couldn't start, so the live preview and attention keywords won't work for this recording: \(error.localizedDescription)"
+        }
     }
 
     private func showAttentionAlert(for keyword: String) {
