@@ -100,16 +100,66 @@ Exactly the shape proposed in `requirement-deepsink-mobile.md` FR-4. Every
 field is optional on the client side (`SessionNotesPayload`) — a partial
 response degrades gracefully rather than failing to decode.
 
-### `local.deploy` — one option to add
+### `deepsink.articulate`
+
+```
+POST /v1/invoke
+{ "service": "deepsink.articulate", "input": "<short, recent transcript excerpt>" }
+200 -> { "output": { "bullets": ["…", …], "speech": "…" } }
+```
+
+Powers Live Assist's Articulate button (see below) — `input` is not the
+full session transcript, just the last few minutes from
+`LiveAssistEngine`'s on-device recognition. Tuned to be fast (tapped
+mid-meeting, waited on) rather than thorough.
+
+### `local.deploy`
 
 DeepSink's `DeployView` reuses yt-run's existing `local.deploy` /
-`mac_deploy` end to end, but that service is currently hardcoded to run
-yt-run's own `install_to_device.sh`. `RouterClient` already sends an extra
-`"project": "deepsink"` in `options` on every deploy call — the smallest
-server-side change is to have `mac_deploy` branch on that option (default
-`"ytrun"` for backward compatibility) and run
-`install_to_deepsink_device.sh` instead when it's `"deepsink"`. No new
-service ID needed.
+`mac_deploy` end to end. `RouterClient` sends an extra `"project": "deepsink"`
+in `options` on every deploy call, which `mac_deploy` branches on (default
+`"ytrun"` for backward compatibility) to run `install_to_deepsink_device.sh`
+instead — both live and working.
+
+All three `deepsink.*` services and the `project` option above are wired up
+and deployed — see `ai-router` and `ai-gateway`'s own READMEs for the
+server-side implementation.
+
+## Live Assist (attention keywords + Articulate)
+
+Phase 1's chunk-then-upload pipeline (rotate every few minutes, transcribe
+after the chunk finishes) is far too slow for "did someone just say my
+name" or "give me an answer to the question from a moment ago" — both need
+much fresher text than a several-minutes-old chunk sitting in the upload
+queue.
+
+`LiveAssistEngine` (`DeepSink/Models/LiveAssistEngine.swift`) solves this
+with on-device speech recognition (Apple's `Speech` framework,
+`requiresOnDeviceRecognition`) run entirely locally — no audio or
+recognized text leaves the phone through this path, only the short excerpt
+Articulate explicitly sends when tapped. It keeps a small rolling buffer
+(`LiveTranscriptBuffer`) of recognized text, which both the keyword-match
+check and Articulate's "last few minutes" read from.
+
+**Deliberately a second, independent `AVAudioEngine` + input tap**, not a
+rework of `AudioRecorder`'s own `AVAudioRecorder`-based file writing.
+Phase-1 recording was already verified working end to end on a real
+meeting before this was built; keeping Live Assist fully isolated means it
+(opt-in, off by default, best-effort per the original ask — "if I'm not
+attending with full attention") can never regress the one thing this app
+absolutely cannot get wrong. Running two independent consumers of the mic
+input at once is a supported iOS pattern, but **this combination hasn't
+been verified on a real device yet** — confirm recording stays
+glitch-free with Live Assist on before relying on both together in a real
+meeting.
+
+Turning Live Assist on in Settings prompts for Speech Recognition
+permission (separate from the Microphone permission recording already
+has) and shows a keyword list (usually just your name) and the Articulate
+window size (default 3 minutes). A keyword match shows a banner + haptic;
+tapping it (or the standing "Articulate" button while recording) opens a
+sheet showing quick-reference bullets and a spoken-style draft from
+`deepsink.articulate`.
 
 ## Audio format
 
@@ -137,6 +187,9 @@ silence," not real VAD — good enough for phase 1.
   Info.plist" below).
 - **`NSSupportsLiveActivities`** — for the lock-screen/Dynamic Island
   recording indicator.
+- **`NSSpeechRecognitionUsageDescription`** — required only if Live Assist
+  is turned on (Settings); requested lazily at that point, not at launch,
+  same pattern as the mic permission.
 - **No photo-library entitlement** — marker photos use `PhotosPicker`
   (`PhotosUI`), which doesn't require any privacy key to *select* an existing
   photo; the picked image is copied into the app's own sandbox, never written

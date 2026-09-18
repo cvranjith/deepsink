@@ -4,17 +4,24 @@ Not built. Each item below names the seam already left for it in the phase-1
 code, per `requirement-deepsink-mobile.md` section 0's instruction to leave a
 clean extension point rather than implementing ahead of scope.
 
-## Live loop (attention alert, topic watchlist, rolling summary)
+## ~~Live loop (attention alert)~~ — built
 
-No seam beyond `AudioRecorder`'s existing level-meter tick — a live pass
-would hook into the same 0.2s timer that already reads `averagePower`, rather
-than adding a second audio tap.
+Built as `LiveAssistEngine` (on-device Speech framework recognition, a
+second isolated `AVAudioEngine` + tap, not the level-meter timer this note
+originally guessed at) plus a configurable keyword list in Settings — see
+the app's README. Topic watchlist and a continuously-updating rolling
+summary are still open: the buffer `LiveAssistEngine` already keeps could
+feed a watchlist match the same way keyword matching does, but nothing
+watches for topics yet, only literal keywords.
 
-## Articulate (on-demand response generation)
+## ~~Articulate (on-demand response generation)~~ — built
 
-Would need a new router service ID (e.g. `deepsink.articulate`) alongside
-`deepsink.notes` — `RouterClient` is already structured as one method per
-service, so this is an additive method, not a restructuring.
+Built as `deepsink.articulate` + `ArticulateSheet`, using
+`LiveAssistEngine`'s rolling on-device transcript as context rather than a
+backend-held session transcript (see the app's README for why: it keeps
+this stateless on the router/gateway side, same as every other service).
+Not yet verified on a real device — the phone wasn't available this
+session.
 
 ## Ask-anything over a session
 
