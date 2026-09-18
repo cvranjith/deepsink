@@ -10,6 +10,7 @@ import SwiftData
 struct DeepSinkApp: App {
     @StateObject private var settings = AppSettings()
     @StateObject private var audioRecorder = AudioRecorder()
+    @StateObject private var liveAssistEngine = LiveAssistEngine()
     @StateObject private var routerClient: RouterClient
     @StateObject private var sessionProcessor: SessionProcessor
 
@@ -24,6 +25,7 @@ struct DeepSinkApp: App {
             ContentView()
                 .environmentObject(settings)
                 .environmentObject(audioRecorder)
+                .environmentObject(liveAssistEngine)
                 .environmentObject(routerClient)
                 .environmentObject(sessionProcessor)
         }

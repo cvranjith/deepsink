@@ -397,6 +397,7 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = DeepSink/Info.plist;
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "DeepSink listens to the room to record meetings for transcription. Audio never leaves this app except to your own configured router, for transcription and note generation.";
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "DeepSink can recognize speech on-device while recording, to notice when a configured keyword (like your name) is said and to give Articulate recent context to work from. This is optional (Live Assist in Settings) and nothing from it leaves your phone except a short excerpt you explicitly send by tapping Articulate.";
 				INFOPLIST_KEY_NSSupportsLiveActivities = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
@@ -436,6 +437,7 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = DeepSink/Info.plist;
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "DeepSink listens to the room to record meetings for transcription. Audio never leaves this app except to your own configured router, for transcription and note generation.";
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "DeepSink can recognize speech on-device while recording, to notice when a configured keyword (like your name) is said and to give Articulate recent context to work from. This is optional (Live Assist in Settings) and nothing from it leaves your phone except a short excerpt you explicitly send by tapping Articulate.";
 				INFOPLIST_KEY_NSSupportsLiveActivities = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;

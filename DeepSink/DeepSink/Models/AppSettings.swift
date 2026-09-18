@@ -16,6 +16,9 @@ final class AppSettings: ObservableObject {
         static let chunkTargetSeconds = "chunkTargetSeconds"
         static let deleteAudioAfterDays = "deleteAudioAfterDays"
         static let announceRecordingReminder = "announceRecordingReminder"
+        static let liveAssistEnabled = "liveAssistEnabled"
+        static let attentionKeywords = "attentionKeywords"
+        static let articulateWindowSeconds = "articulateWindowSeconds"
     }
 
     private enum KeychainAccounts {
@@ -29,6 +32,10 @@ final class AppSettings: ObservableObject {
         // failed upload only ever has to redo a few minutes of audio.
         static let chunkTargetSeconds = 180
         static let deleteAudioAfterDays = 7
+        // 3 minutes — long enough to catch a question asked a little
+        // before you tuned back in, short enough that Articulate's
+        // answer stays focused and the model call stays fast.
+        static let articulateWindowSeconds = 180
     }
 
     @Published var routerURL: String {
@@ -61,6 +68,25 @@ final class AppSettings: ObservableObject {
         didSet { UserDefaults.standard.set(announceRecordingReminder, forKey: Keys.announceRecordingReminder) }
     }
 
+    // Off by default — an additional permission (Speech Recognition) and
+    // ongoing battery/CPU cost on top of plain recording, so it's opt-in
+    // rather than always-on. See LiveAssistEngine.
+    @Published var liveAssistEnabled: Bool {
+        didSet { UserDefaults.standard.set(liveAssistEnabled, forKey: Keys.liveAssistEnabled) }
+    }
+
+    // Usually just the user's own name. Matched case-insensitively as a
+    // substring of whatever LiveAssistEngine recognizes.
+    @Published var attentionKeywords: [String] {
+        didSet { UserDefaults.standard.set(attentionKeywords, forKey: Keys.attentionKeywords) }
+    }
+
+    // How far back Articulate looks when tapped — see
+    // LiveAssistEngine.recentTranscript.
+    @Published var articulateWindowSeconds: Int {
+        didSet { UserDefaults.standard.set(articulateWindowSeconds, forKey: Keys.articulateWindowSeconds) }
+    }
+
     init() {
         let defaults = UserDefaults.standard
         self.routerURL = defaults.string(forKey: Keys.routerURL) ?? ""
@@ -68,5 +94,8 @@ final class AppSettings: ObservableObject {
         self.chunkTargetSeconds = defaults.object(forKey: Keys.chunkTargetSeconds) as? Int ?? Defaults.chunkTargetSeconds
         self.deleteAudioAfterDays = defaults.object(forKey: Keys.deleteAudioAfterDays) as? Int ?? Defaults.deleteAudioAfterDays
         self.announceRecordingReminder = defaults.object(forKey: Keys.announceRecordingReminder) as? Bool ?? true
+        self.liveAssistEnabled = defaults.bool(forKey: Keys.liveAssistEnabled)
+        self.attentionKeywords = defaults.stringArray(forKey: Keys.attentionKeywords) ?? []
+        self.articulateWindowSeconds = defaults.object(forKey: Keys.articulateWindowSeconds) as? Int ?? Defaults.articulateWindowSeconds
     }
 }

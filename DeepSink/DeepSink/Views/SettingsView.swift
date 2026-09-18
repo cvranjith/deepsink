@@ -68,6 +68,42 @@ struct SettingsView: View {
             }
 
             Section {
+                Toggle("Live Assist", isOn: $settings.liveAssistEnabled)
+            } footer: {
+                Text("Runs on-device speech recognition while recording — no audio or text leaves the phone for this — to notice a keyword being said and to give Articulate something recent to work from. Uses extra battery, and needs Speech Recognition permission the first time you turn it on.")
+            }
+
+            if settings.liveAssistEnabled {
+                Section {
+                    ForEach($settings.attentionKeywords, id: \.self) { $keyword in
+                        TextField("e.g. your name", text: $keyword)
+                            .textInputAutocapitalization(.words)
+                            .autocorrectionDisabled()
+                    }
+                    .onDelete { settings.attentionKeywords.remove(atOffsets: $0) }
+                    Button("Add Keyword") {
+                        settings.attentionKeywords.append("")
+                    }
+                } header: {
+                    Text("Attention keywords")
+                } footer: {
+                    Text("Usually your name. Matched case-insensitively as a substring of whatever's recognized — you'll get a banner and a haptic buzz when one's heard.")
+                }
+
+                Section {
+                    Stepper(value: $settings.articulateWindowSeconds, in: 60...600, step: 30) {
+                        HStack {
+                            Text("Articulate window")
+                            Spacer()
+                            Text("\(settings.articulateWindowSeconds / 60) min").foregroundStyle(.secondary)
+                        }
+                    }
+                } footer: {
+                    Text("How far back Articulate looks when you tap it.")
+                }
+            }
+
+            Section {
                 NavigationLink("Update App") {
                     DeployView()
                 }

@@ -145,6 +145,27 @@ final class RouterClient: ObservableObject {
         }
     }
 
+    // A short, recent transcript excerpt (typically the last few
+    // minutes, from LiveAssistEngine's on-device recognition — not the
+    // full accurate transcript) in, quick bullets + a spoken-style draft
+    // out. Meant to be waited on mid-meeting, so this gets a generous
+    // timeout for the same reason the deploy calls do — see that MARK's
+    // comment for the measured Funnel latency this needs to absorb, on
+    // top of however long Codex itself takes.
+    func articulate(recentTranscript: String, settings: AppSettings) async -> Result<ArticulateResponse, RouterError> {
+        let result = await invoke(service: "deepsink.articulate", input: recentTranscript, options: [:], settings: settings, timeout: 100)
+        switch result {
+        case .success(let json):
+            guard let data = try? JSONSerialization.data(withJSONObject: json),
+                  let payload = try? JSONDecoder().decode(ArticulateResponse.self, from: data) else {
+                return .failure(.decoding)
+            }
+            return .success(payload)
+        case .failure(let error):
+            return .failure(error)
+        }
+    }
+
     // MARK: - Deploy
     //
     // Reuses ai-router's existing `local.deploy` / ai-gateway's

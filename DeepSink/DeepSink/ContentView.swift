@@ -6,6 +6,7 @@
 import SwiftUI
 import SwiftData
 import AVFoundation
+import UIKit
 
 // The root screen IS the record screen — FR-1 asks for "a big,
 // unambiguous record/stop control... I will be tapping this at the
@@ -15,6 +16,7 @@ import AVFoundation
 struct ContentView: View {
     @EnvironmentObject var settings: AppSettings
     @EnvironmentObject var audioRecorder: AudioRecorder
+    @EnvironmentObject var liveAssistEngine: LiveAssistEngine
     @EnvironmentObject var sessionProcessor: SessionProcessor
     @StateObject private var networkMonitor = NetworkMonitor()
     @Environment(\.modelContext) private var modelContext
@@ -27,6 +29,8 @@ struct ContentView: View {
     @State private var pendingMarker: Marker?
     @State private var navigateToSessionID: UUID?
     @State private var recordError: String?
+    @State private var attentionKeyword: String?
+    @State private var showArticulateSheet = false
 
     var body: some View {
         NavigationStack {
@@ -37,6 +41,9 @@ struct ContentView: View {
                 if audioRecorder.isRecording {
                     levelMeter
                     markMomentButton
+                    if settings.liveAssistEnabled {
+                        articulateButton
+                    }
                 }
                 Spacer()
             }
@@ -66,12 +73,17 @@ struct ContentView: View {
             .overlay(alignment: .top) {
                 if showReminderBanner {
                     reminderBanner
+                } else if let attentionKeyword {
+                    attentionBanner(for: attentionKeyword)
                 }
             }
             .sheet(isPresented: $showMarkerSheet) {
                 if let pendingMarker {
                     MarkerDetailSheet(marker: pendingMarker)
                 }
+            }
+            .sheet(isPresented: $showArticulateSheet) {
+                ArticulateSheet()
             }
             .alert("Recording", isPresented: Binding(get: { recordError != nil }, set: { if !$0 { recordError = nil } })) {
                 Button("OK", role: .cancel) {}
@@ -153,6 +165,35 @@ struct ContentView: View {
             .transition(.move(edge: .top).combined(with: .opacity))
     }
 
+    private var articulateButton: some View {
+        Button {
+            showArticulateSheet = true
+        } label: {
+            Label("Articulate", systemImage: "sparkles")
+                .font(.headline)
+        }
+        .buttonStyle(.bordered)
+        .tint(.indigo)
+    }
+
+    // Tapping it goes straight to the same Articulate sheet the standing
+    // button opens — the point of the alert is "catch up fast," not just
+    // "you were notified."
+    private func attentionBanner(for keyword: String) -> some View {
+        Button {
+            attentionKeyword = nil
+            showArticulateSheet = true
+        } label: {
+            Label("\"\(keyword)\" mentioned — tap to Articulate", systemImage: "bell.badge.fill")
+                .font(.footnote.weight(.semibold))
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(.orange.opacity(0.2), in: Capsule())
+        }
+        .padding(.top, 8)
+        .transition(.move(edge: .top).combined(with: .opacity))
+    }
+
     private func toggleRecording() {
         if audioRecorder.isRecording {
             stopRecording()
@@ -191,6 +232,9 @@ struct ContentView: View {
                         withAnimation { showReminderBanner = false }
                     }
                 }
+                if settings.liveAssistEnabled {
+                    await startLiveAssistIfPossible()
+                }
             } catch {
                 recordError = "Couldn't start recording: \(error.localizedDescription)"
                 modelContext.delete(session)
@@ -200,9 +244,39 @@ struct ContentView: View {
         }
     }
 
+    // Live Assist failing to start (permission denied, recognizer
+    // unavailable) never blocks or interrupts the actual recording — it's
+    // an opt-in augmentation, not core functionality, per the original
+    // "if I'm not attending with full attention" framing. It just quietly
+    // doesn't run; the record/stop control and everything phase-1 already
+    // does are unaffected either way.
+    private func startLiveAssistIfPossible() async {
+        let authorized = await LiveAssistEngine.requestAuthorizationIfNeeded()
+        guard authorized else { return }
+        liveAssistEngine.onKeywordDetected = { keyword in
+            Task { @MainActor in
+                showAttentionAlert(for: keyword)
+            }
+        }
+        try? liveAssistEngine.start(keywords: settings.attentionKeywords)
+    }
+
+    private func showAttentionAlert(for keyword: String) {
+        withAnimation { attentionKeyword = keyword }
+        UINotificationFeedbackGenerator().notificationOccurred(.warning)
+        Task {
+            try? await Task.sleep(nanoseconds: 10_000_000_000)
+            if attentionKeyword == keyword {
+                withAnimation { attentionKeyword = nil }
+            }
+        }
+    }
+
     private func stopRecording() {
         guard let session = activeSession else { return }
         audioRecorder.stop()
+        liveAssistEngine.stop()
+        attentionKeyword = nil
         session.durationSeconds = audioRecorder.elapsedSeconds
         session.recordingIncomplete = audioRecorder.recordingIncomplete
         session.state = ProcessingState(stage: .uploading, chunksDone: 0, chunksTotal: session.chunks.count, failureReason: nil)
@@ -234,6 +308,8 @@ struct ContentView: View {
     ContentView()
         .environmentObject(AppSettings())
         .environmentObject(AudioRecorder())
+        .environmentObject(LiveAssistEngine())
+        .environmentObject(RouterClient())
         .environmentObject(SessionProcessor(routerClient: RouterClient()))
         .modelContainer(for: [Session.self, ActionItem.self, Marker.self], inMemory: true)
 }
