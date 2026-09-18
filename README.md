@@ -121,7 +121,26 @@ in `options` on every deploy call, which `mac_deploy` branches on (default
 `"ytrun"` for backward compatibility) to run `install_to_deepsink_device.sh`
 instead — both live and working.
 
-All three `deepsink.*` services and the `project` option above are wired up
+### `deepsink.diarize`
+
+```
+POST /v1/invoke
+{
+  "service": "deepsink.diarize",
+  "input": [ { "audio_base64": "<chunk 0>", "start_offset_seconds": 0.0 }, { "audio_base64": "<chunk 1>", "start_offset_seconds": 183.4 }, ... ],
+  "options": { "format": "m4a" }
+}
+200 -> { "output": { "segments": [ { "start": 12.4, "end": 45.1, "speaker": "SPEAKER_00" }, ... ] } }
+```
+
+One call for a session's whole set of chunks, not one per chunk — see
+"Speaker detection" above for why. **Not yet verified end to end with a
+real HuggingFace token** — see `ai-gateway`'s README
+("deepsink_diarize setup") for the one remaining manual step
+(sign up, accept two model licenses, generate a token, save it to
+`hf_token.txt`), after which no code change is needed on either side.
+
+All four `deepsink.*` services and the `project` option above are wired up
 and deployed — see `ai-router` and `ai-gateway`'s own READMEs for the
 server-side implementation.
 
@@ -160,6 +179,36 @@ window size (default 3 minutes). A keyword match shows a banner + haptic;
 tapping it (or the standing "Articulate" button while recording) opens a
 sheet showing quick-reference bullets and a spoken-style draft from
 `deepsink.articulate`.
+
+## Speaker detection
+
+`deepsink.diarize` (see below) plus a "Detect Speakers" button on a
+finished, `.ready` session (`SessionDetailView`) — deliberately on-demand,
+not part of the automatic recording→ready pipeline, and deliberately one
+pass over the *whole* session's audio rather than per-chunk:
+a diarization speaker label ("SPEAKER_00") is only consistent within the
+one run that produced it, so diarizing per-chunk (the way transcription
+already does) would give different numbering in different chunks. This
+also means it needs the session's audio to still exist — disabled with an
+explanation once `deleteAudioAfterDays` has purged it.
+
+The result is a list of `{start, end, speaker}` turns, aligned against
+DeepSink's own already-correct Whisper transcript blocks by time overlap
+(`SpeakerDiarization.assign`) rather than trusting any text the
+diarization step itself might produce — it never sees or touches
+transcript text at all, only timing. Each detected speaker gets a
+default "Person 1", "Person 2", ... label in order of first appearance
+(`SpeakerDiarization.defaultSpeakers`), stored in `Session.speakers` — a
+small rename-able `[id: displayName]` map, edited from the Speakers
+section of a diarized session's detail view. Every transcript block only
+ever stores the raw speaker ID (`TranscriptBlock.speakerID`); renaming a
+speaker updates `Session.speakers` once and every block referencing that
+ID resolves the new name immediately, everywhere (`TranscriptView`,
+markdown export) — nothing is denormalized onto the blocks themselves.
+
+Re-running detection preserves any name you've already given a speaker
+ID that's still present, the same "don't wipe user edits on regen"
+principle FR-4 already applies to notes/action items.
 
 ## Audio format
 

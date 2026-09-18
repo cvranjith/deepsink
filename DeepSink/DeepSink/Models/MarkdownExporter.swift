@@ -60,7 +60,14 @@ enum MarkdownExporter {
         }
         if !session.fullTranscript.isEmpty {
             lines.append("## Transcript")
-            lines.append(session.fullTranscript)
+            if session.isDiarized {
+                for block in session.transcriptBlocks.sorted(by: { $0.startSeconds < $1.startSeconds }) {
+                    let speakerName = session.displayName(forSpeakerID: block.speakerID) ?? "Unknown"
+                    lines.append("**\(speakerName):** \(block.text)")
+                }
+            } else {
+                lines.append(session.fullTranscript)
+            }
         }
         return lines.joined(separator: "\n")
     }

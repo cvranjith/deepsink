@@ -28,6 +28,14 @@ enum RouterError: Error {
     }
 }
 
+// One chunk's raw audio, ready to hand to `diarize` — the caller (see
+// SessionProcessor) reads each chunk file off disk; RouterClient itself
+// never touches the filesystem, same separation `transcribe` already has.
+struct DiarizationChunkInput {
+    let data: Data
+    let startOffsetSeconds: Double
+}
+
 struct RouterDeployWifiInfo {
     let ssid: String?
     let ip: String?
@@ -161,6 +169,46 @@ final class RouterClient: ObservableObject {
                 return .failure(.decoding)
             }
             return .success(payload)
+        case .failure(let error):
+            return .failure(error)
+        }
+    }
+
+    // A whole session's audio, one chunk file per entry — deliberately
+    // one call for the whole session rather than one per chunk, since a
+    // diarization speaker label like "SPEAKER_00" is only consistent
+    // within a single diarization pass; running it per chunk would give
+    // inconsistent numbering across a session. This is the slowest call
+    // this app makes by far (diarizing a long meeting on CPU can take
+    // many minutes, not seconds — see ai-router's own comment on why the
+    // Worker-side timeout matches deepsink_diarize's default 1800s
+    // subprocess timeout), so this gets a matching generous timeout
+    // rather than the "just absorb Funnel latency variance" numbers
+    // elsewhere in this file. For a very long meeting this could still
+    // legitimately take longer than even this — no async start/poll
+    // pattern like the deploy calls have yet; a known limitation, not an
+    // oversight (see README).
+    func diarize(chunks: [DiarizationChunkInput], settings: AppSettings) async -> Result<[DiarizationSegment], RouterError> {
+        let chunkParts: [[String: Any]] = chunks.map {
+            ["audio_base64": $0.data.base64EncodedString(), "start_offset_seconds": $0.startOffsetSeconds]
+        }
+        let result = await invoke(
+            service: "deepsink.diarize",
+            input: chunkParts,
+            options: ["format": "m4a"],
+            settings: settings,
+            timeout: 1200
+        )
+        switch result {
+        case .success(let json):
+            guard let segmentsJSON = json["segments"] as? [[String: Any]] else { return .failure(.decoding) }
+            let segments = segmentsJSON.compactMap { dict -> DiarizationSegment? in
+                guard let start = dict["start"] as? Double,
+                      let end = dict["end"] as? Double,
+                      let speaker = dict["speaker"] as? String else { return nil }
+                return DiarizationSegment(start: start, end: end, speaker: speaker)
+            }
+            return .success(segments)
         case .failure(let error):
             return .failure(error)
         }

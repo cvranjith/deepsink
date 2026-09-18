@@ -25,13 +25,24 @@ final class Session {
     var chunksTotal: Int
     var failureReason: String?
 
-    // Chunk metadata, transcript blocks, and the raw notes payload all
-    // travel as JSON blobs rather than further SwiftData models/
-    // relationships — none of them need independent identity or
-    // querying on their own, just to move with the session as a unit.
+    // Chunk metadata, transcript blocks, the raw notes payload, and
+    // speaker labels all travel as JSON blobs rather than further
+    // SwiftData models/relationships — none of them need independent
+    // identity or querying on their own, just to move with the session
+    // as a unit.
     var chunksData: Data?
     var transcriptBlocksData: Data?
     var notesData: Data?
+    var speakersData: Data?
+
+    // "Detect Speakers" progress — deliberately separate scalars from
+    // `state`/`ProcessingState`, not folded into that 5-stage enum:
+    // diarization is an optional, on-demand, post-ready enhancement, not
+    // part of the recording->ready pipeline every session goes through.
+    // Persisted (not local view state) so it survives the app being
+    // backgrounded or relaunched mid-run, same reasoning as `state` itself.
+    var isDiarizing: Bool
+    var diarizationError: String?
 
     // Audio retention (FR-7): kept until `deleteAudioAfterDays` after
     // `readyAt`, then purged — see SessionProcessor.purgeExpiredAudio.
@@ -59,6 +70,9 @@ final class Session {
         self.chunksData = nil
         self.transcriptBlocksData = nil
         self.notesData = nil
+        self.speakersData = nil
+        self.isDiarizing = false
+        self.diarizationError = nil
         self.audioDeleted = false
         self.readyAt = nil
         self.createdAt = Date()
@@ -107,6 +121,35 @@ final class Session {
             return try? JSONDecoder().decode(SessionNotesPayload.self, from: notesData)
         }
         set { notesData = newValue.flatMap { try? JSONEncoder().encode($0) } }
+    }
+
+    var speakers: [SessionSpeaker] {
+        get {
+            guard let speakersData else { return [] }
+            return (try? JSONDecoder().decode([SessionSpeaker].self, from: speakersData)) ?? []
+        }
+        set { speakersData = try? JSONEncoder().encode(newValue) }
+    }
+
+    var isDiarized: Bool { !speakers.isEmpty }
+
+    func displayName(forSpeakerID id: String?) -> String? {
+        guard let id else { return nil }
+        return speakers.first(where: { $0.id == id })?.displayName
+    }
+
+    // Applies a fresh deepsink.diarize result: reassigns every block's
+    // speakerID, then rebuilds the default "Person N" labels — but keeps
+    // whatever name the user already gave a speaker ID that's still
+    // present, so re-running detection doesn't wipe a rename any more
+    // than regenerating notes wipes a checked action item (same
+    // principle as SessionProcessor.generateNotes).
+    func applyDiarization(segments: [DiarizationSegment]) {
+        let updatedBlocks = SpeakerDiarization.assign(segments: segments, to: transcriptBlocks)
+        transcriptBlocks = updatedBlocks
+        let previousNames = Dictionary(uniqueKeysWithValues: speakers.map { ($0.id, $0.displayName) })
+        let defaults = SpeakerDiarization.defaultSpeakers(for: updatedBlocks)
+        speakers = defaults.map { SessionSpeaker(id: $0.id, displayName: previousNames[$0.id] ?? $0.displayName) }
     }
 
     var openActionItemCount: Int {

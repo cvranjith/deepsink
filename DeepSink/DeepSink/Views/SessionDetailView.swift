@@ -97,6 +97,20 @@ struct SessionDetailView: View {
             if session.state.stage == .ready {
                 Section {
                     Button("Regenerate notes") { retry(regenerateOnly: true) }
+                    speakerDetectionRow
+                } footer: {
+                    if session.audioDeleted {
+                        Text("Detect Speakers needs the session's audio, which has already been auto-deleted.")
+                    }
+                }
+            }
+            if session.isDiarized {
+                Section("Speakers") {
+                    ForEach(session.speakers) { speaker in
+                        SpeakerRenameRow(session: session, speaker: speaker) {
+                            try? modelContext.save()
+                        }
+                    }
                 }
             }
             Section {
@@ -117,6 +131,25 @@ struct SessionDetailView: View {
         }
         .sheet(isPresented: $isSharing) {
             ActivityView(items: [shareText])
+        }
+        .alert("Speaker Detection", isPresented: Binding(
+            get: { session.diarizationError != nil },
+            set: { if !$0 { session.diarizationError = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(session.diarizationError ?? "")
+        }
+    }
+
+    @ViewBuilder
+    private var speakerDetectionRow: some View {
+        if session.isDiarizing {
+            HStack { ProgressView(); Text("Detecting speakers…") }
+        } else if !session.audioDeleted {
+            Button(session.isDiarized ? "Re-detect Speakers" : "Detect Speakers") {
+                sessionProcessor.diarize(session: session, settings: settings, modelContext: modelContext)
+            }
         }
     }
 
@@ -158,6 +191,37 @@ struct SessionDetailView: View {
     private func formattedOffset(_ seconds: Double) -> String {
         let total = Int(seconds)
         return String(format: "%02d:%02d", total / 60, total % 60)
+    }
+}
+
+// A plain text field per speaker, committed on submit — `session.speakers`
+// is a computed property over a JSON blob (see Session.swift), not a
+// stored SwiftData property, so this reads/writes it wholesale rather
+// than trying to bind through it directly.
+private struct SpeakerRenameRow: View {
+    @Bindable var session: Session
+    let speaker: SessionSpeaker
+    var onSave: () -> Void
+
+    @State private var name: String = ""
+
+    var body: some View {
+        TextField("Speaker name", text: $name)
+            .onAppear { name = speaker.displayName }
+            .onSubmit { rename() }
+    }
+
+    private func rename() {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != speaker.displayName else {
+            name = speaker.displayName
+            return
+        }
+        var updated = session.speakers
+        guard let idx = updated.firstIndex(where: { $0.id == speaker.id }) else { return }
+        updated[idx].displayName = trimmed
+        session.speakers = updated
+        onSave()
     }
 }
 

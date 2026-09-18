@@ -51,6 +51,49 @@ final class SessionProcessor: ObservableObject {
         }
     }
 
+    // "Detect Speakers" — manual only, never part of `process`/`resumeAll`.
+    // Reuses `inFlightSessionIDs` with the rest of this class so it can't
+    // run concurrently with a notes regeneration on the same session
+    // (both mutate the session's blobs), even though it tracks its own
+    // progress on `isDiarizing`/`diarizationError` rather than `state`.
+    func diarize(session: Session, settings: AppSettings, modelContext: ModelContext) {
+        guard !inFlightSessionIDs.contains(session.id) else { return }
+        guard !session.audioDeleted, session.state.stage == .ready else { return }
+        inFlightSessionIDs.insert(session.id)
+        session.isDiarizing = true
+        session.diarizationError = nil
+        try? modelContext.save()
+        Task {
+            await runDiarization(session: session, settings: settings, modelContext: modelContext)
+            inFlightSessionIDs.remove(session.id)
+        }
+    }
+
+    private func runDiarization(session: Session, settings: AppSettings, modelContext: ModelContext) async {
+        let chunkInputs: [DiarizationChunkInput] = session.chunks.compactMap { chunk in
+            let url = AudioRecorder.audioDirectory.appendingPathComponent(chunk.fileName)
+            guard let data = try? Data(contentsOf: url) else { return nil }
+            return DiarizationChunkInput(data: data, startOffsetSeconds: chunk.startOffsetSeconds)
+        }
+        guard !chunkInputs.isEmpty else {
+            session.isDiarizing = false
+            session.diarizationError = "Audio files are missing — can't detect speakers."
+            try? modelContext.save()
+            return
+        }
+
+        let result = await routerClient.diarize(chunks: chunkInputs, settings: settings)
+        switch result {
+        case .success(let segments):
+            session.applyDiarization(segments: segments)
+            session.isDiarizing = false
+        case .failure(let error):
+            session.isDiarizing = false
+            session.diarizationError = error.message
+        }
+        try? modelContext.save()
+    }
+
     // Days-based audio purge (FR-7) — call on launch/foreground, same as
     // resumeAll. Only ever removes audio files; transcript and notes,
     // already stored as JSON on the Session, are untouched.

@@ -39,11 +39,22 @@ on the existing `deepsink.notes` call, not new app logic — pairs with the
 "re-run notes on existing transcript" path `SessionProcessor.retryNotes`
 already implements.
 
-## Speaker diarisation
+## ~~Speaker diarisation~~ — built
 
-Significant work, deferred. Would add a `speaker` field to `TranscriptBlock`
-and a per-session speaker-name-mapping model; renaming a speaker once should
-apply retroactively across the whole transcript.
+Built as an on-demand "Detect Speakers" button on a finished session
+(`SessionProcessor.diarize`), not automatic — diarization needs one pass
+over a session's *whole* audio to get consistent speaker numbering
+(a speaker label is only consistent within a single diarization run, so
+per-chunk diarization would give different numbering in different
+chunks), which is real CPU time for a long meeting. Uses `pyannote.audio`
+running locally on the Mac mini in its own isolated Python environment —
+see the app's README and `ai-gateway`'s own README ("deepsink_diarize
+setup") for why it's isolated and the one-time HuggingFace token setup
+this needs. `TranscriptBlock.speakerID` + `Session.speakers` (a
+rename-able "Person 1"/"Person 2"/... map) is exactly the shape this note
+originally guessed at. Not yet verified end to end with a real
+HuggingFace token — the setup step was still in progress when this was
+built; see the app's README for the exact remaining step.
 
 ## Transcript translation / multilingual display
 

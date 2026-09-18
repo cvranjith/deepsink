@@ -33,8 +33,15 @@ struct TranscriptView: View {
                             .font(.caption.monospacedDigit())
                             .foregroundStyle(.secondary)
                             .frame(width: 48, alignment: .leading)
-                        Text(block.text)
-                            .foregroundStyle(.primary)
+                        VStack(alignment: .leading, spacing: 2) {
+                            if let speakerName = session.displayName(forSpeakerID: block.speakerID) {
+                                Text(speakerName)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.indigo)
+                            }
+                            Text(block.text)
+                                .foregroundStyle(.primary)
+                        }
                         Spacer()
                         if playingBlockID == block.id {
                             Image(systemName: "speaker.wave.2.fill").foregroundStyle(.blue)
