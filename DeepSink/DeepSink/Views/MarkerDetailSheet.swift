@@ -22,7 +22,10 @@ struct MarkerDetailSheet: View {
         NavigationStack {
             Form {
                 Section("Comment (optional)") {
-                    TextField("What's happening right now?", text: $comment, axis: .vertical)
+                    HStack(alignment: .top) {
+                        TextField("What's happening right now?", text: $comment, axis: .vertical)
+                        DictationButton(text: $comment)
+                    }
                 }
                 Section("Photo (optional)") {
                     PhotosPicker("Attach a photo", selection: $photoItem, matching: .images)

@@ -16,7 +16,6 @@ struct SessionDetailView: View {
     @State private var isEditingTitle = false
     @State private var isSharing = false
     @State private var shareText = ""
-    @FocusState private var isNotesFocused: Bool
 
     var body: some View {
         List {
@@ -59,19 +58,22 @@ struct SessionDetailView: View {
             Section {
                 TextEditor(text: $session.backgroundNotes)
                     .frame(minHeight: 80)
-                    .focused($isNotesFocused)
-                    .onChange(of: isNotesFocused) { wasFocused, isFocused in
-                        // Saved on losing focus rather than per keystroke
-                        // (a TextEditor has no return-key "commit" the way
-                        // the title field's onCommit does, since newlines
-                        // are legitimate input here) — same "settle, then
-                        // persist" idea, just keyed off focus instead.
-                        if wasFocused, !isFocused {
-                            try? modelContext.save()
-                        }
+                    // Saved on every change rather than gated behind
+                    // losing focus: dictation (DictationButton) writes to
+                    // this same binding without the TextEditor itself
+                    // ever gaining focus, so a focus-only save would miss
+                    // dictated text entirely. SwiftData writes for one
+                    // small text field are cheap enough that saving per
+                    // keystroke isn't worth guarding against.
+                    .onChange(of: session.backgroundNotes) { _, _ in
+                        try? modelContext.save()
                     }
             } header: {
-                Text("Notes")
+                HStack {
+                    Text("Notes")
+                    Spacer()
+                    DictationButton(text: $session.backgroundNotes)
+                }
             } footer: {
                 Text("Background info — who's in the room, the agenda, acronyms, prior context. Sent along with the transcript when generating notes or an Articulate answer, but never treated as something that was said.")
             }
