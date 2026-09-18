@@ -152,9 +152,17 @@ final class RouterClient: ObservableObject {
     // uses, not a new one. The `project` option is the one addition
     // that service needs server-side (it's currently hardcoded to yt-run's
     // own install_to_device.sh) — see README.
+    //
+    // 45s, not yt-run's original 20s: measured directly against the
+    // deployed router, the Cloudflare Worker -> Tailscale Funnel -> Mac
+    // mini round trip for a single wifi_status call varies anywhere from
+    // ~2s to ~19s on its own (Funnel always relays rather than going
+    // peer-to-peer, since the caller is outside the tailnet) - 20s left
+    // almost no margin and could read as "stuck"/timing out on a slow
+    // sample even though the call would have succeeded a second later.
 
     func deployWifiStatus(settings: AppSettings) async -> Result<RouterDeployWifiInfo, RouterError> {
-        switch await invoke(service: "local.deploy", input: nil, options: ["action": "wifi_status", "project": "deepsink"], settings: settings, timeout: 20) {
+        switch await invoke(service: "local.deploy", input: nil, options: ["action": "wifi_status", "project": "deepsink"], settings: settings, timeout: 45) {
         case .success(let json):
             return .success(RouterDeployWifiInfo(
                 ssid: json["ssid"] as? String,
@@ -167,14 +175,14 @@ final class RouterClient: ObservableObject {
     }
 
     func startDeploy(settings: AppSettings) async -> Result<Void, RouterError> {
-        switch await invoke(service: "local.deploy", input: nil, options: ["action": "start_deploy", "project": "deepsink"], settings: settings, timeout: 20) {
+        switch await invoke(service: "local.deploy", input: nil, options: ["action": "start_deploy", "project": "deepsink"], settings: settings, timeout: 45) {
         case .success: return .success(())
         case .failure(let error): return .failure(error)
         }
     }
 
     func deployStatus(settings: AppSettings) async -> Result<RouterDeployStatusInfo, RouterError> {
-        switch await invoke(service: "local.deploy", input: nil, options: ["action": "deploy_status", "project": "deepsink"], settings: settings, timeout: 20) {
+        switch await invoke(service: "local.deploy", input: nil, options: ["action": "deploy_status", "project": "deepsink"], settings: settings, timeout: 45) {
         case .success(let json):
             let status = RouterDeployStatus(rawValue: (json["status"] as? String) ?? "") ?? .idle
             return .success(RouterDeployStatusInfo(status: status, logTail: json["log_tail"] as? String))
