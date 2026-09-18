@@ -212,7 +212,21 @@ struct ContentView: View {
 
             let session = Session(title: Session.defaultTitle(for: Date()), startedAt: Date())
             modelContext.insert(session)
-            try? modelContext.save()
+            do {
+                try modelContext.save()
+            } catch {
+                // Surfaced rather than swallowed (`try?`) on purpose: a
+                // failure here means the session that's about to record
+                // was never actually persisted — silently starting the
+                // recorder anyway is exactly how a real recording once
+                // ended up with a saved audio file and no Session to show
+                // for it (see Session.swift's own comment on the
+                // migration bug this traces back to). Better to refuse to
+                // start than to record into the void again.
+                recordError = "Couldn't save the new session: \(error.localizedDescription)"
+                modelContext.delete(session)
+                return
+            }
             activeSession = session
 
             audioRecorder.targetChunkSeconds = TimeInterval(settings.chunkTargetSeconds)

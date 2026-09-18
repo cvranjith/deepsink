@@ -20,7 +20,16 @@ final class Session {
     // as meeting content itself. Plain stored property (not a computed
     // JSON-blob one like `notes`/`speakers`) since it's simple text a
     // user edits directly, not a structured payload from the router.
-    var backgroundNotes: String
+    //
+    // `= ""` here, not just in `init` below: SwiftData's automatic
+    // lightweight migration reads a non-optional property's *declaration-
+    // site* default to know what value to backfill into existing rows
+    // when this column didn't exist yet — an init-only assignment is
+    // invisible to it. Confirmed the hard way: shipping this without a
+    // declaration default broke migration on a real device with
+    // pre-existing sessions, silently failing every new Session insert
+    // (`try?` swallowed the error) while the app otherwise looked fine.
+    var backgroundNotes: String = ""
 
     // Set the moment an interruption (call, Siri, another app) steals
     // the mic mid-recording — see AudioRecorder's interruption handling.
@@ -50,7 +59,10 @@ final class Session {
     // part of the recording->ready pipeline every session goes through.
     // Persisted (not local view state) so it survives the app being
     // backgrounded or relaunched mid-run, same reasoning as `state` itself.
-    var isDiarizing: Bool
+    //
+    // `= false` at declaration, same migration reasoning as
+    // `backgroundNotes` above — this one shipped with the same bug.
+    var isDiarizing: Bool = false
     var diarizationError: String?
 
     // Audio retention (FR-7): kept until `deleteAudioAfterDays` after

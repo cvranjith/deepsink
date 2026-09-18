@@ -75,10 +75,21 @@ struct SettingsView: View {
 
             if settings.liveAssistEnabled {
                 Section {
-                    ForEach($settings.attentionKeywords, id: \.self) { $keyword in
-                        TextField("e.g. your name", text: $keyword)
-                            .textInputAutocapitalization(.words)
-                            .autocorrectionDisabled()
+                    // Indexed, not `id: \.self` on the strings themselves —
+                    // with value-identity, every keystroke changes the
+                    // element's identity (the string IS the ID), so SwiftUI
+                    // tore down and rebuilt the TextField after each
+                    // character, dropping keyboard focus every time. The
+                    // index is stable while typing and only changes on
+                    // insert/delete, which is exactly when a fresh identity
+                    // is actually wanted.
+                    ForEach(settings.attentionKeywords.indices, id: \.self) { index in
+                        TextField("e.g. your name", text: Binding(
+                            get: { settings.attentionKeywords[index] },
+                            set: { settings.attentionKeywords[index] = $0 }
+                        ))
+                        .textInputAutocapitalization(.words)
+                        .autocorrectionDisabled()
                     }
                     .onDelete { settings.attentionKeywords.remove(atOffsets: $0) }
                     Button("Add Keyword") {
