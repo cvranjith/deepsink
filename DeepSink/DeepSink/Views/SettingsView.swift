@@ -10,6 +10,8 @@ struct SettingsView: View {
     @EnvironmentObject var routerClient: RouterClient
     @State private var isTestingConnection = false
     @State private var connectionMessage: String?
+    @State private var isTestingLogin = false
+    @State private var loginMessage: String?
 
     var body: some View {
         Form {
@@ -30,7 +32,24 @@ struct SettingsView: View {
             } header: {
                 Text("Router")
             } footer: {
-                Text("The same ai-router your other personal apps use. The token is stored in Keychain, never in plain settings — sessions themselves live on the Mac mini, not on this phone.")
+                Text("The same ai-router your other personal apps use — gates the AI calls (Articulate, Update App). Session data itself uses a separate login below.")
+            }
+
+            Section {
+                TextField("DeepSink user ID", text: $settings.deepSinkUserID)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                SecureField("Password", text: $settings.deepSinkPassword)
+                Button {
+                    Task { await testLogin() }
+                } label: {
+                    if isTestingLogin { ProgressView() } else { Text("Test Login") }
+                }
+                .disabled(isTestingLogin)
+            } header: {
+                Text("DeepSink Login")
+            } footer: {
+                Text("A separate login (not the router token above) — this is whose session folder recordings, transcripts, and notes are stored under on the Mac mini. The password is stored in Keychain, never in plain settings.")
             }
 
             Section {
@@ -123,6 +142,11 @@ struct SettingsView: View {
         } message: {
             Text(connectionMessage ?? "")
         }
+        .alert("DeepSink Login", isPresented: Binding(get: { loginMessage != nil }, set: { if !$0 { loginMessage = nil } })) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(loginMessage ?? "")
+        }
     }
 
     private func testConnection() async {
@@ -132,6 +156,16 @@ struct SettingsView: View {
         switch result {
         case .success: connectionMessage = "Connected successfully."
         case .failure(let error): connectionMessage = error.message
+        }
+    }
+
+    private func testLogin() async {
+        isTestingLogin = true
+        let result = await routerClient.testSessionLogin(settings: settings)
+        isTestingLogin = false
+        switch result {
+        case .success: loginMessage = "Signed in successfully."
+        case .failure(let error): loginMessage = error.message
         }
     }
 }

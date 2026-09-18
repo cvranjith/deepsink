@@ -18,10 +18,12 @@ final class AppSettings: ObservableObject {
         static let liveAssistEnabled = "liveAssistEnabled"
         static let attentionKeywords = "attentionKeywords"
         static let articulateWindowSeconds = "articulateWindowSeconds"
+        static let deepSinkUserID = "deepSinkUserID"
     }
 
     private enum KeychainAccounts {
         static let routerToken = "routerToken"
+        static let deepSinkPassword = "deepSinkPassword"
     }
 
     private enum Defaults {
@@ -42,6 +44,19 @@ final class AppSettings: ObservableObject {
 
     @Published var routerToken: String {
         didSet { KeychainStore.write(routerToken, account: KeychainAccounts.routerToken) }
+    }
+
+    // DeepSink's own login (ai-gateway's user_auth.py) — separate from
+    // routerToken above, and separately scoped: this one says whose
+    // session data to read/write, not just "is this a legitimate app."
+    // Exchanged for a short-lived JWT by RouterClient, cached in memory
+    // there, never stored itself beyond this Keychain entry.
+    @Published var deepSinkUserID: String {
+        didSet { UserDefaults.standard.set(deepSinkUserID, forKey: Keys.deepSinkUserID) }
+    }
+
+    @Published var deepSinkPassword: String {
+        didSet { KeychainStore.write(deepSinkPassword, account: KeychainAccounts.deepSinkPassword) }
     }
 
     // Target chunk length before AudioRecorder looks for a quiet moment
@@ -82,6 +97,8 @@ final class AppSettings: ObservableObject {
         let defaults = UserDefaults.standard
         self.routerURL = defaults.string(forKey: Keys.routerURL) ?? ""
         self.routerToken = KeychainStore.read(account: KeychainAccounts.routerToken) ?? ""
+        self.deepSinkUserID = defaults.string(forKey: Keys.deepSinkUserID) ?? ""
+        self.deepSinkPassword = KeychainStore.read(account: KeychainAccounts.deepSinkPassword) ?? ""
         self.chunkTargetSeconds = defaults.object(forKey: Keys.chunkTargetSeconds) as? Int ?? Defaults.chunkTargetSeconds
         self.announceRecordingReminder = defaults.object(forKey: Keys.announceRecordingReminder) as? Bool ?? true
         self.liveAssistEnabled = defaults.bool(forKey: Keys.liveAssistEnabled)

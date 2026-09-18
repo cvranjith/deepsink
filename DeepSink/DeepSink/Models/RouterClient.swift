@@ -11,6 +11,7 @@ enum RouterError: Error {
     case invalidURL
     case network(Error)
     case unauthorized
+    case loginFailed(String)
     case server(String)
     case decoding
     case cancelled
@@ -21,6 +22,7 @@ enum RouterError: Error {
         case .invalidURL: return "The router URL in Settings doesn't look valid."
         case .network(let error): return "Couldn't reach the router: \(error.localizedDescription)"
         case .unauthorized: return "The router rejected this token — check it in Settings."
+        case .loginFailed(let message): return message
         case .server(let message): return message
         case .decoding: return "Got an unexpected response from the router."
         case .cancelled: return "Cancelled."
@@ -51,17 +53,93 @@ struct RouterDeployStatusInfo {
 // never touches a View: every call site above this type only ever sees
 // plain Swift types.
 //
-// Two request shapes live here side by side:
+// Two request shapes live here side by side, each with its own auth:
 //   - `invoke(...)` — the original `/v1/invoke` envelope
 //     (`{service, input, options}` -> `{output}`), used by `articulate`
 //     and the deploy calls, both genuinely stateless AI/action calls.
+//     Authenticated with `settings.routerToken` (this Worker's shared
+//     token) — the same credential every non-DeepSink app using
+//     ai-router already has.
 //   - `restRequest(...)` — plain REST against `/deepsink/sessions/*`
 //     (ai-router proxies this straight through to ai-gateway's own
 //     session store; see that project's README). This is real, stateful
 //     CRUD, not an AI call, so it isn't forced into the invoke envelope —
 //     method/path/body/status all pass through as-is, and every write
-//     endpoint returns the full, current session.
+//     endpoint returns the full, current session. Authenticated with a
+//     separate, human DeepSink user_id/password (see `sessionToken`
+//     below) — that credential scopes data to one user's own folder on
+//     the Mac mini, which a generic shared router token has no concept
+//     of.
 final class RouterClient: ObservableObject {
+
+    // MARK: - DeepSink session login
+    //
+    // A separate, human user_id/password (ai-gateway's user_auth.py),
+    // independent of `routerToken` — that one just says "this is a
+    // legitimate app calling the router at all" (still used by `invoke`
+    // below, unchanged); this one says "this is <user>'s own session
+    // data" and scopes every /deepsink/sessions/* call to that user's
+    // folder on the Mac mini. Cached in memory only (never persisted —
+    // re-login on a cold launch is one cheap call), refreshed a little
+    // ahead of its real ~1-week expiry, same pattern yt-run's
+    // AIGatewayClient already uses for its own OAuth2 token caching.
+
+    private var cachedSessionToken: String?
+    private var cachedSessionTokenExpiry: Date?
+
+    private func sessionToken(settings: AppSettings) async -> Result<String, RouterError> {
+        if let cachedSessionToken, let cachedSessionTokenExpiry, cachedSessionTokenExpiry > Date() {
+            return .success(cachedSessionToken)
+        }
+
+        guard let baseURL = Self.baseURL(from: settings) else {
+            return .failure(settings.routerURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .notConfigured : .invalidURL)
+        }
+        let userID = settings.deepSinkUserID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let password = settings.deepSinkPassword
+        guard !userID.isEmpty, !password.isEmpty else { return .failure(.notConfigured) }
+
+        var request = URLRequest(url: baseURL.appendingPathComponent("deepsink/auth/token"))
+        request.httpMethod = "POST"
+        request.timeoutInterval = 45
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["user_id": userID, "password": password])
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await URLSession.shared.data(for: request)
+        } catch {
+            return .failure(.network(error))
+        }
+
+        guard let http = response as? HTTPURLResponse,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return .failure(.decoding)
+        }
+        guard (200...299).contains(http.statusCode),
+              let accessToken = json["access_token"] as? String,
+              let expiresIn = json["expires_in"] as? Double else {
+            let message = (json["error_description"] as? String) ?? (json["error"] as? String)
+                ?? "Sign-in failed — check the DeepSink user ID/password in Settings."
+            return .failure(.loginFailed(message))
+        }
+
+        cachedSessionToken = accessToken
+        cachedSessionTokenExpiry = Date().addingTimeInterval(expiresIn - 3600)
+        return .success(accessToken)
+    }
+
+    // Lets Settings validate a user_id/password without waiting on some
+    // other, unrelated session call to surface a login failure.
+    func testSessionLogin(settings: AppSettings) async -> Result<Void, RouterError> {
+        cachedSessionToken = nil
+        cachedSessionTokenExpiry = nil
+        switch await sessionToken(settings: settings) {
+        case .success: return .success(())
+        case .failure(let error): return .failure(error)
+        }
+    }
 
     // MARK: - Session store (server is the source of truth — see
     // DeepSinkSession's own doc comment)
@@ -339,8 +417,14 @@ final class RouterClient: ObservableObject {
         guard let baseURL = Self.baseURL(from: settings) else {
             return .failure(settings.routerURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .notConfigured : .invalidURL)
         }
-        let token = settings.routerToken.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !token.isEmpty else { return .failure(.notConfigured) }
+        // The DeepSink user's own session token, NOT `routerToken` — see
+        // the "DeepSink session login" MARK above for why these are two
+        // separate credentials.
+        let tokenResult = await sessionToken(settings: settings)
+        guard case .success(let token) = tokenResult else {
+            if case .failure(let error) = tokenResult { return .failure(error) }
+            return .failure(.decoding)
+        }
 
         var request = URLRequest(url: baseURL.appendingPathComponent(path))
         request.httpMethod = method
@@ -361,7 +445,14 @@ final class RouterClient: ObservableObject {
         }
 
         guard let http = response as? HTTPURLResponse else { return .failure(.decoding) }
-        if http.statusCode == 401 { return .failure(.unauthorized) }
+        if http.statusCode == 401 {
+            // The cached session token might have just expired (clock
+            // skew, or the week finally ran out) — drop it so the next
+            // call re-logs-in instead of repeating the same dead token.
+            cachedSessionToken = nil
+            cachedSessionTokenExpiry = nil
+            return .failure(.unauthorized)
+        }
         guard (200...299).contains(http.statusCode) else {
             let message = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error"] as? String
             return .failure(.server(message ?? "Request failed (\(http.statusCode))."))
