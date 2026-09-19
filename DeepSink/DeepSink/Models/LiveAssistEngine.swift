@@ -44,7 +44,20 @@ final class LiveAssistEngine: ObservableObject {
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var task: SFSpeechRecognitionTask?
     private var restartTimer: Timer?
+    // Two separate buffers, same underlying class, different lifetimes -
+    // conflating them was the actual bug behind "the live preview keeps
+    // erasing what I already said": `buffer` is what Articulate reads
+    // (recentTranscript(seconds:)), a genuine rolling time-window that's
+    // supposed to forget old content; `livePreviewBuffer` backs
+    // `livePreviewText` (the recording screen and web viewer's live
+    // line) and is scoped to "since the last chunk actually
+    // materialized" instead - cleared only in markMaterialized(upTo:)
+    // below, once a chunk's real Whisper transcript has landed, never on
+    // a timer. A fixed rolling window doesn't have a "the real
+    // transcript caught up" concept to align itself with, which is
+    // exactly why using one for this was wrong.
     private let buffer = LiveTranscriptBuffer()
+    private let livePreviewBuffer = LiveTranscriptBuffer()
 
     private var sessionStartDate: Date?
     private var keywords: [String] = []
@@ -53,15 +66,15 @@ final class LiveAssistEngine: ObservableObject {
     private(set) var isRunning = false
     var onKeywordDetected: ((String) -> Void)?
 
-    // A rolling window of recognized text for the recording screen's
-    // "live preview" (see ContentView) — same underlying buffer
-    // `recentTranscript(seconds:)` reads on demand for Articulate, just
-    // kept published so a view can show it updating in real time instead
-    // of polling. Deliberately labelled as rough/on-device in the UI:
-    // this is Apple's live recognizer, not the Whisper transcript that
-    // eventually replaces it once the session is processed.
+    // Everything on-device-recognized since the last chunk actually
+    // materialized (see markMaterialized(upTo:)) - not a rolling time
+    // window. Read by the recording screen and pushed verbatim to the
+    // web viewer's live_preview (ContentView's startLivePreviewLoop),
+    // so both show exactly the same text. Deliberately labelled as
+    // rough/on-device in the UI: this is Apple's live recognizer, not
+    // the Whisper transcript that eventually replaces it once a chunk
+    // uploads.
     @Published private(set) var livePreviewText = ""
-    private static let livePreviewWindowSeconds: TimeInterval = 120
 
     // Not because on-device recognition tasks are documented to have a
     // hard duration cap (that limit was specifically for server-based
@@ -96,6 +109,7 @@ final class LiveAssistEngine: ObservableObject {
         self.keywords = keywords
         sessionStartDate = Date()
         buffer.reset()
+        livePreviewBuffer.reset()
         livePreviewText = ""
 
         let inputNode = engine.inputNode
@@ -145,6 +159,21 @@ final class LiveAssistEngine: ObservableObject {
         return buffer.recentText(seconds: seconds, currentOffset: elapsed)
     }
 
+    // Called once a chunk's real, Whisper-accurate transcript has landed
+    // server-side (ContentView's performChunkUpload, on a successful
+    // upload only — never on a failed one, so the rough text keeps
+    // showing until a retry actually succeeds). `offsetSeconds` is in
+    // this same engine's own elapsed-since-start clock, matching what
+    // `handle` below timestamps every entry with - the caller is
+    // responsible for converting from AudioRecorder's session-absolute
+    // chunk offsets (which, unlike this engine's clock, keep counting
+    // across a Resume) back to this recording segment's own local time;
+    // see ContentView's own comment at the call site.
+    func markMaterialized(upToSessionOffset offsetSeconds: TimeInterval) {
+        livePreviewBuffer.trimMaterialized(upTo: offsetSeconds)
+        livePreviewText = livePreviewBuffer.allText()
+    }
+
     private func startRecognitionTask() {
         guard let recognizer = SFSpeechRecognizer(), recognizer.isAvailable else { return }
         speechRecognizer = recognizer
@@ -174,10 +203,12 @@ final class LiveAssistEngine: ObservableObject {
             let text = result.bestTranscription.formattedString
             let elapsed = Date().timeIntervalSince(sessionStartDate)
             buffer.updateCurrentUtterance(text: text, offsetSeconds: elapsed)
-            livePreviewText = buffer.recentText(seconds: Self.livePreviewWindowSeconds, currentOffset: elapsed)
+            livePreviewBuffer.updateCurrentUtterance(text: text, offsetSeconds: elapsed)
+            livePreviewText = livePreviewBuffer.allText()
             checkKeywords(in: text)
             if result.isFinal {
                 buffer.finishUtterance()
+                livePreviewBuffer.finishUtterance()
                 alreadyFiredForUtterance = false
             }
         }
@@ -187,6 +218,7 @@ final class LiveAssistEngine: ObservableObject {
             // back up rather than silently going dark for the rest of
             // the meeting.
             buffer.finishUtterance()
+            livePreviewBuffer.finishUtterance()
             alreadyFiredForUtterance = false
             restartRecognitionTask()
         }

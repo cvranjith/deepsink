@@ -368,7 +368,12 @@ struct ContentView: View {
                 let viewers = await routerClient.liveViewerCount(sessionID: sessionID, settings: settings)
                 guard !Task.isCancelled else { return }
                 if viewers > 0 {
-                    let text = liveAssistEngine.recentTranscript(seconds: 20)
+                    // The exact same text the recording screen itself
+                    // shows (livePreviewText — everything since the last
+                    // chunk materialized, not a fixed window), so the
+                    // web viewer never shows something different from,
+                    // or less complete than, what's on the phone.
+                    let text = liveAssistEngine.livePreviewText
                     if text != lastPushedText {
                         await routerClient.postLivePreview(sessionID: sessionID, text: text, settings: settings)
                         lastPushedText = text
@@ -430,6 +435,18 @@ struct ContentView: View {
             if activeSession?.id == session.id {
                 activeSession = session
             }
+            // The real, Whisper-accurate transcript for this stretch of
+            // time just landed - the rough on-device version of the same
+            // stretch should stop showing now, not before (a failed
+            // upload never reaches here, so it keeps showing until a
+            // retry actually succeeds - see the .failure case below).
+            // `chunk.startOffsetSeconds` is session-absolute (keeps
+            // counting across a Resume), but LiveAssistEngine's own
+            // clock always restarts at 0 for each recording/resume
+            // segment - subtracting resumeBaseOffsetSeconds converts
+            // back to that same local basis.
+            let localEnd = chunk.startOffsetSeconds - resumeBaseOffsetSeconds + chunk.durationSeconds
+            liveAssistEngine.markMaterialized(upToSessionOffset: localEnd)
             try? FileManager.default.removeItem(at: url)
         case .failure:
             pendingChunkUploads.append((chunk, sessionID))

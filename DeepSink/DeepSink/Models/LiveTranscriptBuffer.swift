@@ -59,6 +59,28 @@ final class LiveTranscriptBuffer {
             .joined(separator: " ")
     }
 
+    // Everything currently held, with no time filtering — for a buffer
+    // that's already scoped to "since the last chunk materialized"
+    // (see LiveAssistEngine's separate livePreviewBuffer), that scoping
+    // itself is the only window that should apply; a second, fixed-time
+    // window on top of it is what made the live preview look like it
+    // kept erasing older-but-still-unmaterialized speech.
+    func allText() -> String {
+        entries
+            .filter { !$0.text.isEmpty }
+            .map(\.text)
+            .joined(separator: " ")
+    }
+
+    // Drops everything at or before `offsetSeconds` — for when a chunk's
+    // real, Whisper-accurate transcript has actually landed and this
+    // buffer's rough version of that same stretch of time should stop
+    // being shown. Anything after `offsetSeconds` (already-in-progress
+    // speech for the next, not-yet-uploaded chunk) is left untouched.
+    func trimMaterialized(upTo offsetSeconds: TimeInterval) {
+        entries.removeAll { $0.offsetSeconds < offsetSeconds }
+    }
+
     func reset() {
         entries.removeAll()
         isUtteranceOpen = false
