@@ -16,11 +16,18 @@ struct SettingsView: View {
     var body: some View {
         Form {
             Section {
-                TextField("https://ai-router.<subdomain>.workers.dev", text: $settings.routerURL)
+                TextField("http://Ranjiths-Mac-mini.local:8788", text: $settings.gatewayLANURL)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
                     .keyboardType(.URL)
-                SecureField("Bearer token", text: $settings.routerToken)
+                TextField("https://<name>.ts.net/gateway", text: $settings.gatewayFunnelURL)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .keyboardType(.URL)
+                TextField("Client ID", text: $settings.gatewayClientID)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                SecureField("Client secret", text: $settings.gatewayClientSecret)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
                 Button {
@@ -30,9 +37,9 @@ struct SettingsView: View {
                 }
                 .disabled(isTestingConnection)
             } header: {
-                Text("Router")
+                Text("AI Gateway (Mac mini)")
             } footer: {
-                Text("The same ai-router your other personal apps use — gates the AI calls (Articulate, Update App). Session data itself uses a separate login below.")
+                Text("Talks to the Mac mini directly — no Cloudflare hop. The LAN address is tried first (fast, same Wi-Fi only) and the Funnel address is the fallback when you're away from home. Client ID/secret gate the AI calls (Articulate, Update App) — a credential this app registers for itself, not a shared token. Session data itself uses a separate login below.")
             }
 
             Section {

@@ -18,13 +18,13 @@ enum RouterError: Error {
 
     var message: String {
         switch self {
-        case .notConfigured: return "Set the router URL and token in Settings."
-        case .invalidURL: return "The router URL in Settings doesn't look valid."
-        case .network(let error): return "Couldn't reach the router: \(error.localizedDescription)"
-        case .unauthorized: return "The router rejected this token — check it in Settings."
+        case .notConfigured: return "Set the Mac mini's LAN/Funnel URL and client credentials in Settings."
+        case .invalidURL: return "One of the gateway URLs in Settings doesn't look valid."
+        case .network(let error): return "Couldn't reach the Mac mini: \(error.localizedDescription)"
+        case .unauthorized: return "The gateway rejected this client — check the client ID/secret in Settings."
         case .loginFailed(let message): return message
         case .server(let message): return message
-        case .decoding: return "Got an unexpected response from the router."
+        case .decoding: return "Got an unexpected response from the Mac mini."
         case .cancelled: return "Cancelled."
         }
     }
@@ -45,56 +45,175 @@ struct RouterDeployStatusInfo {
     let logTail: String?
 }
 
-// One small, testable surface for everything DeepSink calls ai-router
-// for — ported from yt-run's AIGatewayClient, trimmed to just the
-// token/`local.*` path (DeepSink never talks to ai-gateway directly, and
-// never holds a provider API key — see requirement-deepsink-mobile.md
-// section 2). Swapping the router URL, token, or adding a service ID
-// never touches a View: every call site above this type only ever sees
-// plain Swift types.
+// Talks to ai-gateway on the Mac mini directly — no Cloudflare/ai-router
+// hop. That Worker added nothing for this single-user app (no fan-out to
+// other backends, one client), so it's been cut from DeepSink's path
+// entirely (yt-run still uses it for its own purposes — untouched).
 //
-// Two request shapes live here side by side, each with its own auth:
-//   - `invoke(...)` — the original `/v1/invoke` envelope
-//     (`{service, input, options}` -> `{output}`), used by `articulate`
-//     and the deploy calls, both genuinely stateless AI/action calls.
-//     Authenticated with `settings.routerToken` (this Worker's shared
-//     token) — the same credential every non-DeepSink app using
-//     ai-router already has.
+// Every call here first resolves a base URL via `resolveBaseURL`: the
+// Mac mini's LAN address (its own Bonjour hostname, fast, no internet
+// hop) when reachable, falling back to its Tailscale Funnel URL
+// otherwise — see that function's own comment for the probe/cache/
+// fallback design. Two request shapes live here side by side, each with
+// its own auth, both against whichever base URL that resolves to:
+//   - `invoke(...)` — ai-gateway's own `/invoke` envelope
+//     (`{service_id, params}` -> `{result}`), used by `articulate` and
+//     the deploy calls, both genuinely stateless AI/action calls.
+//     Authenticated with an OAuth2 Client Credentials token (`clientToken`
+//     below), fetched from `/oauth/token` using `settings.gatewayClientID`/
+//     `gatewayClientSecret` — this app's own registered ai-gateway client,
+//     where ai-router used to hold and exchange one on its behalf.
 //   - `restRequest(...)` — plain REST against `/deepsink/sessions/*`
-//     (ai-router proxies this straight through to ai-gateway's own
-//     session store; see that project's README). This is real, stateful
-//     CRUD, not an AI call, so it isn't forced into the invoke envelope —
-//     method/path/body/status all pass through as-is, and every write
-//     endpoint returns the full, current session. Authenticated with a
-//     separate, human DeepSink user_id/password (see `sessionToken`
-//     below) — that credential scopes data to one user's own folder on
-//     the Mac mini, which a generic shared router token has no concept
-//     of.
+//     (ai-gateway's own session store; see that project's README). This
+//     is real, stateful CRUD, not an AI call, so it isn't forced into the
+//     invoke envelope — method/path/body/status all pass through as-is,
+//     and every write endpoint returns the full, current session.
+//     Authenticated with a separate, human DeepSink user_id/password (see
+//     `sessionToken` below) — that credential scopes data to one user's
+//     own folder on the Mac mini, which the client-credentials token above
+//     has no concept of (it just says "this is a legitimate DeepSink
+//     install," not "this is <user>'s data").
 final class RouterClient: ObservableObject {
 
-    // MARK: - DeepSink session login
+    // MARK: - Base URL resolution (LAN-preferred, Funnel-fallback)
+    //
+    // Probed rather than inferred from SSID: matching the phone's own
+    // Wi-Fi network name would need the "Access WiFi Information"
+    // entitlement and still wouldn't prove the Mac mini is actually
+    // reachable (same SSID elsewhere, subnet isolation, the Mac asleep).
+    // A short, direct `/health` request against the LAN URL answers the
+    // only question that actually matters — "can I reach it right now" —
+    // with no extra permissions. The result is cached briefly so a whole
+    // burst of calls (e.g. chunk upload immediately followed by a session
+    // refetch) doesn't re-probe for each one; a real request failure
+    // against a cached LAN choice invalidates the cache and retries once
+    // against Funnel immediately, rather than waiting out the TTL while
+    // stuck on a base URL that just stopped working (e.g. walking out of
+    // Wi-Fi range mid-session).
+
+    private struct ResolvedBase {
+        let url: URL
+        let isLAN: Bool
+    }
+
+    private var cachedBase: ResolvedBase?
+    private var cachedBaseTimestamp: Date?
+    private let baseCacheTTL: TimeInterval = 30
+    private let lanProbeTimeout: TimeInterval = 2.5
+
+    private func resolveBaseURL(settings: AppSettings, forceFresh: Bool = false) async -> Result<ResolvedBase, RouterError> {
+        if !forceFresh, let cachedBase, let cachedBaseTimestamp, Date().timeIntervalSince(cachedBaseTimestamp) < baseCacheTTL {
+            return .success(cachedBase)
+        }
+
+        let lan = settings.gatewayLANURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let funnel = settings.gatewayFunnelURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !lan.isEmpty || !funnel.isEmpty else { return .failure(.notConfigured) }
+
+        if !lan.isEmpty, let lanURL = Self.normalizedURL(lan) {
+            if await Self.probe(lanURL, timeout: lanProbeTimeout) {
+                let resolved = ResolvedBase(url: lanURL, isLAN: true)
+                cachedBase = resolved
+                cachedBaseTimestamp = Date()
+                return .success(resolved)
+            }
+        }
+
+        guard let funnelURL = Self.normalizedURL(funnel) else {
+            return .failure(funnel.isEmpty ? .notConfigured : .invalidURL)
+        }
+        let resolved = ResolvedBase(url: funnelURL, isLAN: false)
+        cachedBase = resolved
+        cachedBaseTimestamp = Date()
+        return .success(resolved)
+    }
+
+    private static func probe(_ baseURL: URL, timeout: TimeInterval) async -> Bool {
+        var request = URLRequest(url: baseURL.appendingPathComponent("health"))
+        request.httpMethod = "GET"
+        request.timeoutInterval = timeout
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            return (response as? HTTPURLResponse)?.statusCode == 200
+        } catch {
+            return false
+        }
+    }
+
+    private static func normalizedURL(_ raw: String) -> URL? {
+        var trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if trimmed.hasSuffix("/") { trimmed.removeLast() }
+        return URL(string: trimmed)
+    }
+
+    // MARK: - ai-gateway OAuth2 Client Credentials (for `/invoke`)
+
+    private var cachedClientToken: String?
+    private var cachedClientTokenExpiry: Date?
+
+    private func clientToken(baseURL: URL, settings: AppSettings) async -> Result<String, RouterError> {
+        if let cachedClientToken, let cachedClientTokenExpiry, cachedClientTokenExpiry > Date() {
+            return .success(cachedClientToken)
+        }
+
+        let clientID = settings.gatewayClientID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let clientSecret = settings.gatewayClientSecret
+        guard !clientID.isEmpty, !clientSecret.isEmpty else { return .failure(.notConfigured) }
+
+        var request = URLRequest(url: baseURL.appendingPathComponent("oauth/token"))
+        request.httpMethod = "POST"
+        request.timeoutInterval = 20
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["client_id": clientID, "client_secret": clientSecret])
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await URLSession.shared.data(for: request)
+        } catch {
+            return .failure(.network(error))
+        }
+
+        guard let http = response as? HTTPURLResponse,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return .failure(.decoding)
+        }
+        guard (200...299).contains(http.statusCode),
+              let accessToken = json["access_token"] as? String,
+              let expiresIn = json["expires_in"] as? Double else {
+            if http.statusCode == 401 { return .failure(.unauthorized) }
+            let message = (json["error_description"] as? String) ?? (json["error"] as? String)
+                ?? "Sign-in failed — check the client ID/secret in Settings."
+            return .failure(.loginFailed(message))
+        }
+
+        cachedClientToken = accessToken
+        // 1-hour token — refresh 5 minutes ahead rather than the ~1-hour
+        // margin the (~1-week) session token uses below, so this doesn't
+        // effectively never refresh.
+        cachedClientTokenExpiry = Date().addingTimeInterval(expiresIn - 300)
+        return .success(accessToken)
+    }
+
+    // MARK: - DeepSink session login (for `/deepsink/sessions/*`)
     //
     // A separate, human user_id/password (ai-gateway's user_auth.py),
-    // independent of `routerToken` — that one just says "this is a
-    // legitimate app calling the router at all" (still used by `invoke`
-    // below, unchanged); this one says "this is <user>'s own session
-    // data" and scopes every /deepsink/sessions/* call to that user's
-    // folder on the Mac mini. Cached in memory only (never persisted —
-    // re-login on a cold launch is one cheap call), refreshed a little
-    // ahead of its real ~1-week expiry, same pattern yt-run's
-    // AIGatewayClient already uses for its own OAuth2 token caching.
+    // independent of the client-credentials token above — that one just
+    // says "this is a legitimate DeepSink install"; this one says "this
+    // is <user>'s own session data" and scopes every /deepsink/sessions/*
+    // call to that user's folder on the Mac mini. Cached in memory only
+    // (never persisted — re-login on a cold launch is one cheap call),
+    // refreshed a little ahead of its real ~1-week expiry.
 
     private var cachedSessionToken: String?
     private var cachedSessionTokenExpiry: Date?
 
-    private func sessionToken(settings: AppSettings) async -> Result<String, RouterError> {
+    private func sessionToken(baseURL: URL, settings: AppSettings) async -> Result<String, RouterError> {
         if let cachedSessionToken, let cachedSessionTokenExpiry, cachedSessionTokenExpiry > Date() {
             return .success(cachedSessionToken)
         }
 
-        guard let baseURL = Self.baseURL(from: settings) else {
-            return .failure(settings.routerURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .notConfigured : .invalidURL)
-        }
         let userID = settings.deepSinkUserID.trimmingCharacters(in: .whitespacesAndNewlines)
         let password = settings.deepSinkPassword
         guard !userID.isEmpty, !password.isEmpty else { return .failure(.notConfigured) }
@@ -135,7 +254,12 @@ final class RouterClient: ObservableObject {
     func testSessionLogin(settings: AppSettings) async -> Result<Void, RouterError> {
         cachedSessionToken = nil
         cachedSessionTokenExpiry = nil
-        switch await sessionToken(settings: settings) {
+        let baseResult = await resolveBaseURL(settings: settings)
+        guard case .success(let base) = baseResult else {
+            if case .failure(let error) = baseResult { return .failure(error) }
+            return .failure(.decoding)
+        }
+        switch await sessionToken(baseURL: base.url, settings: settings) {
         case .success: return .success(())
         case .failure(let error): return .failure(error)
         }
@@ -209,8 +333,7 @@ final class RouterClient: ObservableObject {
 
     // Doubles as the transcription call now — the server transcribes via
     // Whisper and persists the chunk + transcript blocks in one request,
-    // so this needs the same generous timeout deepsink.transcribe used
-    // to get for the same reason (CPU-only Whisper on the Mac mini).
+    // so this needs a generous timeout (CPU-only Whisper on the Mac mini).
     func uploadChunk(
         sessionID: String,
         chunkIndex: Int,
@@ -230,8 +353,7 @@ final class RouterClient: ObservableObject {
         return decodeSessionResult(await restRequest(method: "POST", path: "deepsink/sessions/\(sessionID)/chunks", body: body, settings: settings, timeout: 300))
     }
 
-    // Codex over the accumulated transcript can take a while — same
-    // budget deepsink.notes used to get.
+    // Codex over the accumulated transcript can take a while.
     func finishSession(id: String, settings: AppSettings) async -> Result<DeepSinkSession, RouterError> {
         decodeSessionResult(await restRequest(method: "POST", path: "deepsink/sessions/\(id)/finish", body: nil, settings: settings, timeout: 180))
     }
@@ -252,10 +374,6 @@ final class RouterClient: ObservableObject {
 
     // Diarizing a long meeting on CPU can take many minutes — matches
     // the gateway's own 1800s subprocess timeout for deepsink_diarize.
-    // The server tracks `is_diarizing` itself, but since this call is a
-    // single, directly-awaited HTTP request (not a start/poll pair), the
-    // client doesn't need to poll separately — it already blocks until
-    // the real answer comes back.
     func diarizeSession(id: String, settings: AppSettings) async -> Result<DeepSinkSession, RouterError> {
         decodeSessionResult(await restRequest(method: "POST", path: "deepsink/sessions/\(id)/diarize", body: nil, settings: settings, timeout: 1800))
     }
@@ -273,15 +391,17 @@ final class RouterClient: ObservableObject {
     }
 
     // Sends a deliberately unknown service ID and reads the *shape* of
-    // the rejection, same trick as yt-run's AIGatewayClient: 401 means
-    // the token itself was rejected; a 400 "unknown_service" means the
-    // token was accepted and this got as far as service routing.
+    // the rejection: a 401 means the client credentials themselves were
+    // rejected; a 400 whose message names an unknown service_id means
+    // the credentials were accepted and this got as far as service
+    // routing — ai-gateway's own /invoke reports that as
+    // `{"error": "unknown service_id '...' - known: [...]"}"`.
     func testConnection(settings: AppSettings) async -> Result<Void, RouterError> {
-        switch await invoke(service: "__ping__", input: nil, options: [:], settings: settings, timeout: 15) {
+        switch await invoke(serviceID: "__ping__", params: [:], settings: settings, timeout: 15) {
         case .success:
             return .success(())
         case .failure(let error):
-            if case .server(let message) = error, message.contains("unknown_service") {
+            if case .server(let message) = error, message.contains("unknown service_id") {
                 return .success(())
             }
             return .failure(error)
@@ -291,15 +411,16 @@ final class RouterClient: ObservableObject {
     // A short, recent transcript excerpt (typically the last few
     // minutes, from LiveAssistEngine's on-device recognition — not the
     // full accurate transcript) in, quick bullets + a spoken-style draft
-    // out. Meant to be waited on mid-meeting, so this gets a generous
-    // timeout for the same reason the deploy calls do — see that MARK's
-    // comment for the measured Funnel latency this needs to absorb, on
-    // top of however long Codex itself takes. Deliberately still
-    // stateless/on-device: Articulate never touches the server session
-    // store, since it needs to work off text that's fresher than
-    // whatever's landed there so far.
+    // out. Deliberately still stateless/on-device: Articulate never
+    // touches the server session store, since it needs to work off text
+    // that's fresher than whatever's landed there so far.
     func articulate(recentTranscript: String, backgroundNotes: String, settings: AppSettings) async -> Result<ArticulateResponse, RouterError> {
-        let result = await invoke(service: "deepsink.articulate", input: recentTranscript, options: ["background_notes": backgroundNotes], settings: settings, timeout: 100)
+        let result = await invoke(
+            serviceID: "deepsink_articulate",
+            params: ["transcript": recentTranscript, "background_notes": backgroundNotes],
+            settings: settings,
+            timeout: 100
+        )
         switch result {
         case .success(let json):
             guard let data = try? JSONSerialization.data(withJSONObject: json),
@@ -314,22 +435,14 @@ final class RouterClient: ObservableObject {
 
     // MARK: - Deploy
     //
-    // Reuses ai-router's existing `local.deploy` / ai-gateway's
-    // `mac_deploy` — the exact mechanism yt-run's DeployView already
-    // uses, not a new one. The `project` option is the one addition
-    // that service needs server-side (it's currently hardcoded to yt-run's
-    // own install_to_device.sh) — see README.
-    //
-    // 45s, not yt-run's original 20s: measured directly against the
-    // deployed router, the Cloudflare Worker -> Tailscale Funnel -> Mac
-    // mini round trip for a single wifi_status call varies anywhere from
-    // ~2s to ~19s on its own (Funnel always relays rather than going
-    // peer-to-peer, since the caller is outside the tailnet) - 20s left
-    // almost no margin and could read as "stuck"/timing out on a slow
-    // sample even though the call would have succeeded a second later.
+    // Reuses ai-gateway's existing `mac_deploy` service — the same
+    // mechanism yt-run's DeployView already uses, just called directly
+    // now instead of through ai-router. The `project` param is the one
+    // addition that service needed server-side (it's otherwise hardcoded
+    // to yt-run's own install_to_device.sh) — see ai-gateway's README.
 
     func deployWifiStatus(settings: AppSettings) async -> Result<RouterDeployWifiInfo, RouterError> {
-        switch await invoke(service: "local.deploy", input: nil, options: ["action": "wifi_status", "project": "deepsink"], settings: settings, timeout: 45) {
+        switch await invoke(serviceID: "mac_deploy", params: ["action": "wifi_status", "project": "deepsink"], settings: settings, timeout: 45) {
         case .success(let json):
             return .success(RouterDeployWifiInfo(
                 ssid: json["ssid"] as? String,
@@ -342,14 +455,14 @@ final class RouterClient: ObservableObject {
     }
 
     func startDeploy(settings: AppSettings) async -> Result<Void, RouterError> {
-        switch await invoke(service: "local.deploy", input: nil, options: ["action": "start_deploy", "project": "deepsink"], settings: settings, timeout: 45) {
+        switch await invoke(serviceID: "mac_deploy", params: ["action": "start_deploy", "project": "deepsink"], settings: settings, timeout: 45) {
         case .success: return .success(())
         case .failure(let error): return .failure(error)
         }
     }
 
     func deployStatus(settings: AppSettings) async -> Result<RouterDeployStatusInfo, RouterError> {
-        switch await invoke(service: "local.deploy", input: nil, options: ["action": "deploy_status", "project": "deepsink"], settings: settings, timeout: 45) {
+        switch await invoke(serviceID: "mac_deploy", params: ["action": "deploy_status", "project": "deepsink"], settings: settings, timeout: 45) {
         case .success(let json):
             let status = RouterDeployStatus(rawValue: (json["status"] as? String) ?? "") ?? .idle
             return .success(RouterDeployStatusInfo(status: status, logTail: json["log_tail"] as? String))
@@ -358,25 +471,29 @@ final class RouterClient: ObservableObject {
         }
     }
 
-    // MARK: - Transport (/v1/invoke envelope — stateless AI/action calls)
+    // MARK: - Transport (ai-gateway's `/invoke` envelope — stateless AI/action calls)
 
     private func invoke(
-        service: String,
-        input: Any?,
-        options: [String: Any],
+        serviceID: String,
+        params: [String: Any],
         settings: AppSettings,
         timeout: TimeInterval
     ) async -> Result<[String: Any], RouterError> {
-        guard let baseURL = Self.baseURL(from: settings) else {
-            return .failure(settings.routerURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .notConfigured : .invalidURL)
+        let baseResult = await resolveBaseURL(settings: settings)
+        guard case .success(let base) = baseResult else {
+            if case .failure(let error) = baseResult { return .failure(error) }
+            return .failure(.decoding)
         }
-        let token = settings.routerToken.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !token.isEmpty else { return .failure(.notConfigured) }
 
-        var body: [String: Any] = ["service": service, "options": options]
-        if let input { body["input"] = input }
+        let tokenResult = await clientToken(baseURL: base.url, settings: settings)
+        guard case .success(let token) = tokenResult else {
+            if case .failure(let error) = tokenResult { return .failure(error) }
+            return .failure(.decoding)
+        }
 
-        var request = URLRequest(url: baseURL.appendingPathComponent("v1/invoke"))
+        let body: [String: Any] = ["service_id": serviceID, "params": params]
+
+        var request = URLRequest(url: base.url.appendingPathComponent("invoke"))
         request.httpMethod = "POST"
         request.timeoutInterval = timeout
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -389,11 +506,24 @@ final class RouterClient: ObservableObject {
             (data, response) = try await URLSession.shared.data(for: request)
         } catch {
             if (error as NSError).code == NSURLErrorCancelled { return .failure(.cancelled) }
+            // A LAN base URL that just went stale (walked out of range,
+            // Mac asleep) shouldn't sit dead for the rest of the cache
+            // TTL — drop it and retry this one call against Funnel before
+            // giving up.
+            if base.isLAN {
+                cachedBase = nil
+                cachedBaseTimestamp = nil
+                return await invoke(serviceID: serviceID, params: params, settings: settings, timeout: timeout)
+            }
             return .failure(.network(error))
         }
 
         guard let http = response as? HTTPURLResponse else { return .failure(.decoding) }
-        if http.statusCode == 401 { return .failure(.unauthorized) }
+        if http.statusCode == 401 {
+            cachedClientToken = nil
+            cachedClientTokenExpiry = nil
+            return .failure(.unauthorized)
+        }
 
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return .failure(.decoding)
@@ -402,7 +532,7 @@ final class RouterClient: ObservableObject {
             let message = (json["message"] as? String) ?? (json["error"] as? String) ?? "Request failed (\(http.statusCode))."
             return .failure(.server(message))
         }
-        return .success((json["output"] as? [String: Any]) ?? json)
+        return .success((json["result"] as? [String: Any]) ?? json)
     }
 
     // MARK: - Transport (plain REST — /deepsink/sessions/*)
@@ -414,19 +544,22 @@ final class RouterClient: ObservableObject {
         settings: AppSettings,
         timeout: TimeInterval
     ) async -> Result<Data, RouterError> {
-        guard let baseURL = Self.baseURL(from: settings) else {
-            return .failure(settings.routerURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .notConfigured : .invalidURL)
+        let baseResult = await resolveBaseURL(settings: settings)
+        guard case .success(let base) = baseResult else {
+            if case .failure(let error) = baseResult { return .failure(error) }
+            return .failure(.decoding)
         }
-        // The DeepSink user's own session token, NOT `routerToken` — see
-        // the "DeepSink session login" MARK above for why these are two
-        // separate credentials.
-        let tokenResult = await sessionToken(settings: settings)
+
+        // The DeepSink user's own session token, NOT the client-credentials
+        // token — see the "DeepSink session login" MARK above for why
+        // these are two separate credentials.
+        let tokenResult = await sessionToken(baseURL: base.url, settings: settings)
         guard case .success(let token) = tokenResult else {
             if case .failure(let error) = tokenResult { return .failure(error) }
             return .failure(.decoding)
         }
 
-        var request = URLRequest(url: baseURL.appendingPathComponent(path))
+        var request = URLRequest(url: base.url.appendingPathComponent(path))
         request.httpMethod = method
         request.timeoutInterval = timeout
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -441,6 +574,11 @@ final class RouterClient: ObservableObject {
             (data, response) = try await URLSession.shared.data(for: request)
         } catch {
             if (error as NSError).code == NSURLErrorCancelled { return .failure(.cancelled) }
+            if base.isLAN {
+                cachedBase = nil
+                cachedBaseTimestamp = nil
+                return await restRequest(method: method, path: path, body: body, settings: settings, timeout: timeout)
+            }
             return .failure(.network(error))
         }
 
@@ -458,12 +596,5 @@ final class RouterClient: ObservableObject {
             return .failure(.server(message ?? "Request failed (\(http.statusCode))."))
         }
         return .success(data)
-    }
-
-    private static func baseURL(from settings: AppSettings) -> URL? {
-        var trimmed = settings.routerURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        if trimmed.hasSuffix("/") { trimmed.removeLast() }
-        return URL(string: trimmed)
     }
 }

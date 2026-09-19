@@ -12,7 +12,9 @@ import Combine
 // app's token gates real meeting content (see KeychainStore).
 final class AppSettings: ObservableObject {
     private enum Keys {
-        static let routerURL = "routerURL"
+        static let gatewayLANURL = "gatewayLANURL"
+        static let gatewayFunnelURL = "gatewayFunnelURL"
+        static let gatewayClientID = "gatewayClientID"
         static let chunkTargetSeconds = "chunkTargetSeconds"
         static let announceRecordingReminder = "announceRecordingReminder"
         static let liveAssistEnabled = "liveAssistEnabled"
@@ -22,7 +24,7 @@ final class AppSettings: ObservableObject {
     }
 
     private enum KeychainAccounts {
-        static let routerToken = "routerToken"
+        static let gatewayClientSecret = "gatewayClientSecret"
         static let deepSinkPassword = "deepSinkPassword"
     }
 
@@ -38,12 +40,31 @@ final class AppSettings: ObservableObject {
         static let articulateWindowSeconds = 180
     }
 
-    @Published var routerURL: String {
-        didSet { UserDefaults.standard.set(routerURL, forKey: Keys.routerURL) }
+    // The Mac mini's ai-gateway, reached two ways — no Cloudflare/ai-router
+    // hop anymore (see RouterClient's own doc comment for why): LAN is
+    // preferred when reachable (its own local Bonjour hostname, e.g.
+    // "http://Ranjiths-Mac-mini.local:8788" — a raw IP would drift under
+    // DHCP), with the Tailscale Funnel URL (already including its "/gateway"
+    // Caddy prefix, e.g. "https://ranjiths-mac-mini.tailXXXX.ts.net/gateway")
+    // as the fallback for off-LAN use.
+    @Published var gatewayLANURL: String {
+        didSet { UserDefaults.standard.set(gatewayLANURL, forKey: Keys.gatewayLANURL) }
     }
 
-    @Published var routerToken: String {
-        didSet { KeychainStore.write(routerToken, account: KeychainAccounts.routerToken) }
+    @Published var gatewayFunnelURL: String {
+        didSet { UserDefaults.standard.set(gatewayFunnelURL, forKey: Keys.gatewayFunnelURL) }
+    }
+
+    // ai-gateway's own OAuth2 Client Credentials (auth.py) — what
+    // ai-router used to hold and exchange on this app's behalf. Now that
+    // the phone talks to ai-gateway directly, it needs its own registered
+    // client (see generate_config.py) rather than borrowing the Worker's.
+    @Published var gatewayClientID: String {
+        didSet { UserDefaults.standard.set(gatewayClientID, forKey: Keys.gatewayClientID) }
+    }
+
+    @Published var gatewayClientSecret: String {
+        didSet { KeychainStore.write(gatewayClientSecret, account: KeychainAccounts.gatewayClientSecret) }
     }
 
     // DeepSink's own login (ai-gateway's user_auth.py) — separate from
@@ -95,8 +116,10 @@ final class AppSettings: ObservableObject {
 
     init() {
         let defaults = UserDefaults.standard
-        self.routerURL = defaults.string(forKey: Keys.routerURL) ?? ""
-        self.routerToken = KeychainStore.read(account: KeychainAccounts.routerToken) ?? ""
+        self.gatewayLANURL = defaults.string(forKey: Keys.gatewayLANURL) ?? ""
+        self.gatewayFunnelURL = defaults.string(forKey: Keys.gatewayFunnelURL) ?? ""
+        self.gatewayClientID = defaults.string(forKey: Keys.gatewayClientID) ?? ""
+        self.gatewayClientSecret = KeychainStore.read(account: KeychainAccounts.gatewayClientSecret) ?? ""
         self.deepSinkUserID = defaults.string(forKey: Keys.deepSinkUserID) ?? ""
         self.deepSinkPassword = KeychainStore.read(account: KeychainAccounts.deepSinkPassword) ?? ""
         self.chunkTargetSeconds = defaults.object(forKey: Keys.chunkTargetSeconds) as? Int ?? Defaults.chunkTargetSeconds
