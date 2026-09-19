@@ -36,22 +36,49 @@ struct SessionDetailView: View {
     @EnvironmentObject var settings: AppSettings
     @EnvironmentObject var routerClient: RouterClient
     @EnvironmentObject var sessionStore: DeepSinkSessionStore
+    @EnvironmentObject var audioRecorder: AudioRecorder
+    @EnvironmentObject var liveAssistEngine: LiveAssistEngine
     @Environment(\.dismiss) private var dismiss
 
     @State private var isEditingTitle = false
     @State private var isSharing = false
     @State private var shareText = ""
     @State private var isDeleting = false
-    @State private var selectedTab: SessionTab = .notes
+    @State private var selectedTab: SessionTab
     @State private var isRegeneratingNotes = false
     @State private var actionErrorMessage: String?
     @State private var diarizationErrorMessage: String?
     @State private var notesSaveTask: Task<Void, Never>?
     @State private var renamingSpeaker: SessionSpeaker?
     @State private var renameText = ""
+    @State private var showMarkerSheet = false
+    @State private var pendingMarkerOffset: Double?
+    @State private var showArticulateSheet = false
 
-    init(session: DeepSinkSession) {
+    init(session: DeepSinkSession, startOnTranscriptTab: Bool = false) {
         _session = State(initialValue: session)
+        _selectedTab = State(initialValue: startOnTranscriptTab ? .transcript : .notes)
+    }
+
+    // True only when THIS device is actively recording THIS exact
+    // session right now (not just "server thinks it's live," which can
+    // also mean "someone recorded it, walked away, and it's stuck" —
+    // see the header's own stage label for that case instead). Drives
+    // the recording control bar, the reminder/attention banners, and
+    // the live-preview trailing line in the Transcript tab.
+    private var isActiveRecording: Bool {
+        sessionStore.activeRecordingSessionID == session.id && audioRecorder.isRecording
+    }
+
+    // Broader than isActiveRecording on purpose: also true right after
+    // Stop (finish/diarize still processing server-side, possibly for
+    // several seconds or minutes) and for a session someone else/another
+    // device is actively feeding. Drives the polling loop below — the
+    // point is "does this session still have server-side work that
+    // could change what's on screen," not "is this device the one doing
+    // it."
+    private var shouldPollLive: Bool {
+        !session.isTerminal || session.isGeneratingNotes || session.isDiarizing
     }
 
     var body: some View {
@@ -83,8 +110,30 @@ struct SessionDetailView: View {
                 }
             }
         }
+        .overlay(alignment: .top) {
+            if isActiveRecording {
+                if sessionStore.showReminderBanner {
+                    reminderBanner
+                } else if let keyword = sessionStore.attentionKeyword {
+                    attentionBanner(for: keyword)
+                }
+            }
+        }
+        .safeAreaInset(edge: .bottom) {
+            if isActiveRecording {
+                recordingControlBar
+            }
+        }
         .sheet(isPresented: $isSharing) {
             ActivityView(items: [shareText])
+        }
+        .sheet(isPresented: $showMarkerSheet) {
+            if let pendingMarkerOffset {
+                MarkerDetailSheet(sessionID: session.id, offsetSeconds: pendingMarkerOffset)
+            }
+        }
+        .sheet(isPresented: $showArticulateSheet) {
+            ArticulateSheet(session: session)
         }
         .confirmationDialog("Delete this session?", isPresented: $isDeleting, titleVisibility: .visible) {
             Button("Delete", role: .destructive) { deleteSession() }
@@ -131,6 +180,122 @@ struct SessionDetailView: View {
                 sessionStore.apply(latest)
             }
         }
+        // Chunk uploads land through ContentView's own upload loop while
+        // THIS device is recording this session, which updates the
+        // store directly — this is what surfaces that here immediately,
+        // since this view's own `session` is a local copy that write
+        // doesn't otherwise touch.
+        .onChange(of: sessionStore.sessions) { _, _ in
+            if let latest = sessionStore.session(id: session.id) {
+                session = latest
+            }
+        }
+        // Catches everything a same-device chunk upload doesn't: a
+        // background notes regen or auto-diarize finishing (both run
+        // async, after this device's own upload response already came
+        // back), or this exact session being fed by another device
+        // entirely. Self-stopping — restarts only when shouldPollLive's
+        // value actually changes, so it stops on its own once the
+        // session actually settles.
+        .task(id: shouldPollLive) {
+            guard shouldPollLive else { return }
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                guard !Task.isCancelled else { return }
+                if case .success(let latest) = await routerClient.getSession(id: session.id, settings: settings) {
+                    session = latest
+                    sessionStore.apply(latest)
+                }
+            }
+        }
+    }
+
+    // MARK: - Recording controls (only while isActiveRecording)
+
+    private var recordingControlBar: some View {
+        VStack(spacing: 10) {
+            recordingLevelMeter
+            HStack(spacing: 12) {
+                Text(formattedElapsed(sessionStore.activeRecordingBaseOffsetSeconds + audioRecorder.elapsedSeconds))
+                    .font(.headline.monospacedDigit())
+                Spacer()
+                Button {
+                    markMoment()
+                } label: {
+                    Image(systemName: "bookmark.fill")
+                }
+                .buttonStyle(.bordered)
+                if settings.liveAssistEnabled {
+                    Button {
+                        showArticulateSheet = true
+                    } label: {
+                        Image(systemName: "sparkles")
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.indigo)
+                }
+                Button {
+                    sessionStore.stopRecordingRequest = true
+                } label: {
+                    Image(systemName: "stop.circle.fill")
+                        .foregroundStyle(.red)
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+        .padding()
+        .background(.bar)
+    }
+
+    private var recordingLevelMeter: some View {
+        GeometryReader { proxy in
+            RoundedRectangle(cornerRadius: 4)
+                .fill(.secondary.opacity(0.2))
+                .overlay(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 4)
+                        .fill(.red)
+                        .frame(width: proxy.size.width * CGFloat(audioRecorder.currentLevel))
+                }
+        }
+        .frame(height: 8)
+    }
+
+    private var reminderBanner: some View {
+        Text("🔴 Recording — let the room know")
+            .font(.footnote.weight(.semibold))
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .background(.red.opacity(0.15), in: Capsule())
+            .padding(.top, 8)
+            .transition(.move(edge: .top).combined(with: .opacity))
+    }
+
+    // Tapping it goes straight to the Articulate sheet — the point of
+    // the alert is "catch up fast," not just "you were notified."
+    private func attentionBanner(for keyword: String) -> some View {
+        Button {
+            sessionStore.attentionKeyword = nil
+            showArticulateSheet = true
+        } label: {
+            Label("\"\(keyword)\" mentioned — tap to Articulate", systemImage: "bell.badge.fill")
+                .font(.footnote.weight(.semibold))
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(.orange.opacity(0.2), in: Capsule())
+        }
+        .padding(.top, 8)
+        .transition(.move(edge: .top).combined(with: .opacity))
+    }
+
+    private func markMoment() {
+        pendingMarkerOffset = sessionStore.activeRecordingBaseOffsetSeconds + audioRecorder.elapsedSeconds
+        showMarkerSheet = true
+    }
+
+    private func formattedElapsed(_ seconds: TimeInterval) -> String {
+        let total = Int(seconds)
+        let h = total / 3600, m = (total % 3600) / 60, s = total % 60
+        return h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%02d:%02d", m, s)
     }
 
     // MARK: - Header (always visible)
@@ -174,24 +339,27 @@ struct SessionDetailView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            // No stage check here — session.stage just reflects
-            // recording/uploading/ready/failed on the SERVER (e.g. a
-            // title-only session created ahead of time starts at
-            // "recording" with zero chunks), not whether THIS device is
-            // actively recording something right now. That guard lives
-            // centrally in ContentView.resumeRecording instead, since
-            // it's the one place that actually knows AudioRecorder's
-            // live state.
-            Button {
-                sessionStore.resumeRequest = session
-                dismiss()
-            } label: {
-                Label("Resume Recording", systemImage: "record.circle")
-                    .font(.footnote.weight(.semibold))
+            // Hidden while this device is already recording this exact
+            // session — no stage check beyond that, since session.stage
+            // just reflects recording/uploading/ready/failed on the
+            // SERVER (e.g. a title-only session created ahead of time
+            // starts at "recording" with zero chunks) and says nothing
+            // about whether THIS device is the one doing it. The
+            // double-recording guard itself lives centrally in
+            // ContentView.resumeRecording, since it's the one place that
+            // actually knows AudioRecorder's live state.
+            if !isActiveRecording {
+                Button {
+                    sessionStore.resumeRequest = session
+                    dismiss()
+                } label: {
+                    Label("Resume Recording", systemImage: "record.circle")
+                        .font(.footnote.weight(.semibold))
+                }
+                .buttonStyle(.bordered)
+                .tint(.red)
+                .padding(.top, 2)
             }
-            .buttonStyle(.bordered)
-            .tint(.red)
-            .padding(.top, 2)
         }
         .padding(.horizontal)
         .padding(.top, 8)
@@ -239,6 +407,12 @@ struct SessionDetailView: View {
 
     private var notesTab: some View {
         List {
+            if session.isGeneratingNotes {
+                Section {
+                    HStack { ProgressView(); Text("Generating notes…") }
+                        .foregroundStyle(.secondary)
+                }
+            }
             if let summary = session.notes?.summary, !summary.isEmpty {
                 Section("Summary") { Text(summary) }
             }
@@ -270,7 +444,7 @@ struct SessionDetailView: View {
                     } label: {
                         if isRegeneratingNotes { ProgressView() } else { Text("Regenerate notes") }
                     }
-                    .disabled(isRegeneratingNotes)
+                    .disabled(isRegeneratingNotes || session.isGeneratingNotes)
                 }
             }
         }
@@ -319,14 +493,27 @@ struct SessionDetailView: View {
                     }
                 }
             }
-            if session.transcriptBlocks.isEmpty {
+            // The live line only ever shows while this device is the one
+            // actively recording this exact session — rough, on-device
+            // recognition of whatever's currently being said, not yet
+            // transcribed by the server. Disappears the moment the chunk
+            // it's part of actually uploads and lands as real
+            // transcriptBlocks below it (same relationship the web
+            // viewer's live_preview has to its own transcript).
+            let liveText = isActiveRecording ? liveAssistEngine.livePreviewText : ""
+            if session.transcriptBlocks.isEmpty && liveText.isEmpty {
                 Section {
-                    Text("No transcript yet.")
+                    Text(isActiveRecording ? "Listening…" : "No transcript yet.")
                         .foregroundStyle(.secondary)
                 }
             } else {
                 Section("Transcript") {
                     TranscriptBlocksList(session: session)
+                    if !liveText.isEmpty {
+                        Text(liveText)
+                            .italic()
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
         }

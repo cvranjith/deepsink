@@ -42,6 +42,14 @@ struct DeepSinkSession: Codable, Identifiable, Equatable {
     var speakers: [SessionSpeaker]
     var isDiarizing: Bool
     var diarizationError: String?
+    // True while a background notes/action-items regeneration is
+    // running server-side (see ai-gateway's _generate_notes) - lets the
+    // Notes tab show a real "generating" indicator instead of just
+    // looking empty/stuck while one's in flight, whether it was
+    // triggered by this device's own chunk upload, /finish, or anything
+    // else (background auto-regen fires after every chunk, not just at
+    // the end).
+    var isGeneratingNotes: Bool
 }
 
 struct ServerChunk: Codable, Identifiable, Equatable {
@@ -77,11 +85,10 @@ struct ServerMarker: Codable, Identifiable, Equatable {
 // SpeakerDiarization.swift now runs exactly once, on the server, since
 // the server is what actually produces the diarization result).
 //
-// NOTE: there is currently no server endpoint to rename a speaker after
-// the fact (`PATCH /deepsink/sessions/<id>` only accepts title/
-// background_notes/duration_seconds/recording_incomplete) — renaming is
-// not wired up in this pass; see SessionDetailView's Speakers section,
-// shown read-only with a comment explaining why.
+// Renaming (RouterClient.renameSpeaker, `PATCH .../speakers/<id>`) is
+// also the roster-enrollment step server-side (speaker_roster.py) — a
+// recognized regular gets their real name auto-applied on a later
+// diarization instead of a fresh "Person N".
 struct SessionSpeaker: Codable, Identifiable, Hashable {
     var id: String
     var displayName: String

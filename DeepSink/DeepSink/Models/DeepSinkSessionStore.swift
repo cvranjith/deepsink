@@ -27,6 +27,40 @@ final class DeepSinkSessionStore: ObservableObject {
     // it works regardless of how deep SessionDetailView was pushed.
     @Published var resumeRequest: DeepSinkSession?
 
+    // The rest of this block is the same idea, extended: recording now
+    // happens inside the same SessionDetailView used for browsing any
+    // other session (not a separate dedicated screen), so whichever
+    // recording-related state used to live only in ContentView's own
+    // @State needs to be readable from wherever that view actually is —
+    // ContentView still owns starting/stopping and all the upload/
+    // finish bookkeeping, this is just what other views need to know or
+    // trigger.
+    //
+    // `activeRecordingSessionID`/`activeRecordingBaseOffsetSeconds` let
+    // any SessionDetailView answer "is this me?" and compute a marker's
+    // session-absolute offset correctly even mid-resume (see
+    // AudioRecorder.start's own comment on why a resumed recording's
+    // elapsedSeconds alone isn't the session's cumulative time).
+    @Published var activeRecordingSessionID: String?
+    @Published var activeRecordingBaseOffsetSeconds: TimeInterval = 0
+
+    // SessionDetailView's Stop button sets this; ContentView observes it
+    // the same way it observes `resumeRequest`, and runs its own
+    // stopRecording() (awaiting in-flight uploads, PATCHing final
+    // duration, calling /finish, tearing down Live Assist/the live-
+    // preview loop) - logic that stays private to ContentView since it
+    // closes over @State only it has.
+    @Published var stopRecordingRequest = false
+
+    // The reminder banner and attention-keyword alert used to be plain
+    // @State overlays on ContentView's own root view - which stopped
+    // working the moment recording moved into a *pushed* SessionDetailView,
+    // since an overlay on a view sitting underneath a navigation push
+    // isn't part of what's actually drawn. Moved here so whichever view
+    // is currently showing the active recording can render them.
+    @Published var showReminderBanner = false
+    @Published var attentionKeyword: String?
+
     private let routerClient: RouterClient
 
     init(routerClient: RouterClient) {

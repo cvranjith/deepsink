@@ -9,11 +9,22 @@ import UIKit
 
 // Home screen: recent sessions as cards up top, a compact record control
 // pinned to the bottom via `.safeAreaInset` so it's always reachable
-// regardless of scroll position or which state (browsing vs. recording)
-// is showing above it. Originally just one big centered record button on
-// an otherwise empty screen — redesigned after seeing how comparable
-// apps (Voicenotes, Otter-style tools) lay this out: recent items are
-// the useful thing to land on, not an empty circle.
+// regardless of scroll position. Originally just one big centered record
+// button on an otherwise empty screen — redesigned after seeing how
+// comparable apps (Voicenotes, Otter-style tools) lay this out: recent
+// items are the useful thing to land on, not an empty circle.
+//
+// Recording itself no longer has its own dedicated screen here — tapping
+// Record navigates straight into the same SessionDetailView used to
+// browse any other session (defaulting to its Transcript tab), so the
+// previous transcript, notes-so-far, and everything else are reachable
+// while recording, not hidden behind a separate view. This class still
+// owns the whole recording lifecycle (chunk upload, the live-preview push
+// loop, Stop's finish/cleanup sequence) — SessionDetailView reads/
+// triggers pieces of it through DeepSinkSessionStore's shared state
+// (`activeRecordingSessionID`, `stopRecordingRequest`, etc. — see that
+// type's own comments), the same cross-view pattern `resumeRequest`
+// already established.
 struct ContentView: View {
     @EnvironmentObject var settings: AppSettings
     @EnvironmentObject var audioRecorder: AudioRecorder
@@ -24,14 +35,9 @@ struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
 
     @State private var activeSession: DeepSinkSession?
-    @State private var showReminderBanner = false
-    @State private var showMarkerSheet = false
-    @State private var pendingMarkerOffset: Double?
     @State private var navigateToSessionID: String?
     @State private var recordError: String?
     @State private var liveAssistError: String?
-    @State private var attentionKeyword: String?
-    @State private var showArticulateSheet = false
 
     // Chunks upload to the server as soon as AudioRecorder finishes
     // writing each one — not batched at Stop — so both of these track
@@ -48,7 +54,10 @@ struct ContentView: View {
     // sequence rather than restarting both at 0 (see AudioRecorder.start)
     // — this is the "continue" baseline added back to this segment's own
     // elapsedSeconds when computing the total duration sent to the
-    // server at Stop. Always 0 for a brand-new session.
+    // server at Stop. Always 0 for a brand-new session. Mirrored onto
+    // sessionStore.activeRecordingBaseOffsetSeconds too, since
+    // SessionDetailView's own Mark Moment needs the same baseline and
+    // this state is private here.
     @State private var resumeBaseOffsetSeconds: TimeInterval = 0
 
     // Pushes LiveAssistEngine's rolling text to the server on a slow
@@ -66,63 +75,44 @@ struct ContentView: View {
 
     var body: some View {
         NavigationStack {
-            Group {
-                if audioRecorder.isRecording {
-                    recordingPanel
-                } else {
-                    homeContent
-                }
-            }
-            .navigationTitle("DeepSink")
-            .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) {
-                    NavigationLink {
-                        SessionListView()
-                    } label: {
-                        Image(systemName: "list.bullet")
+            homeContent
+                .navigationTitle("DeepSink")
+                .toolbar {
+                    ToolbarItem(placement: .navigationBarLeading) {
+                        NavigationLink {
+                            SessionListView()
+                        } label: {
+                            Image(systemName: "list.bullet")
+                        }
+                    }
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        NavigationLink {
+                            SettingsView()
+                        } label: {
+                            Image(systemName: "gearshape")
+                        }
                     }
                 }
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    NavigationLink {
-                        SettingsView()
-                    } label: {
-                        Image(systemName: "gearshape")
+                .navigationDestination(item: $navigateToSessionID) { id in
+                    if let session = sessionStore.session(id: id) {
+                        SessionDetailView(session: session, startOnTranscriptTab: audioRecorder.isRecording)
                     }
                 }
-            }
-            .navigationDestination(item: $navigateToSessionID) { id in
-                if let session = sessionStore.session(id: id) {
-                    SessionDetailView(session: session)
+                .safeAreaInset(edge: .bottom) {
+                    if !audioRecorder.isRecording {
+                        recordButtonBar
+                    }
                 }
-            }
-            .overlay(alignment: .top) {
-                if showReminderBanner {
-                    reminderBanner
-                } else if let attentionKeyword {
-                    attentionBanner(for: attentionKeyword)
+                .alert("Recording", isPresented: Binding(get: { recordError != nil }, set: { if !$0 { recordError = nil } })) {
+                    Button("OK", role: .cancel) {}
+                } message: {
+                    Text(recordError ?? "")
                 }
-            }
-            .safeAreaInset(edge: .bottom) {
-                recordButtonBar
-            }
-            .sheet(isPresented: $showMarkerSheet) {
-                if let activeSession, let pendingMarkerOffset {
-                    MarkerDetailSheet(sessionID: activeSession.id, offsetSeconds: pendingMarkerOffset)
+                .alert("Live Assist", isPresented: Binding(get: { liveAssistError != nil }, set: { if !$0 { liveAssistError = nil } })) {
+                    Button("OK", role: .cancel) {}
+                } message: {
+                    Text(liveAssistError ?? "")
                 }
-            }
-            .sheet(isPresented: $showArticulateSheet) {
-                ArticulateSheet(session: activeSession)
-            }
-            .alert("Recording", isPresented: Binding(get: { recordError != nil }, set: { if !$0 { recordError = nil } })) {
-                Button("OK", role: .cancel) {}
-            } message: {
-                Text(recordError ?? "")
-            }
-            .alert("Live Assist", isPresented: Binding(get: { liveAssistError != nil }, set: { if !$0 { liveAssistError = nil } })) {
-                Button("OK", role: .cancel) {}
-            } message: {
-                Text(liveAssistError ?? "")
-            }
         }
         .onAppear {
             Task { await sessionStore.refresh(settings: settings) }
@@ -140,6 +130,11 @@ struct ContentView: View {
             guard let session else { return }
             sessionStore.resumeRequest = nil
             resumeRecording(session: session)
+        }
+        .onChange(of: sessionStore.stopRecordingRequest) { _, requested in
+            guard requested, audioRecorder.isRecording else { return }
+            sessionStore.stopRecordingRequest = false
+            stopRecording()
         }
     }
 
@@ -191,56 +186,6 @@ struct ContentView: View {
         .padding(.top, 60)
     }
 
-    // MARK: - Recording
-
-    private var recordingPanel: some View {
-        ScrollView {
-            VStack(spacing: 20) {
-                Text(formattedElapsed(audioRecorder.elapsedSeconds))
-                    .font(.system(size: 48, weight: .semibold, design: .rounded))
-                    .monospacedDigit()
-                    .padding(.top, 12)
-                levelMeter
-                livePreviewSection
-                HStack(spacing: 12) {
-                    markMomentButton
-                    if settings.liveAssistEnabled {
-                        articulateButton
-                    }
-                }
-            }
-            .padding(.horizontal)
-            .padding(.bottom, 100)
-        }
-    }
-
-    private var livePreviewSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Label("Live preview", systemImage: "waveform.badge.mic")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-            Group {
-                if !settings.liveAssistEnabled {
-                    Text("Turn on Live Assist in Settings for a live, on-device preview of what's being said.")
-                        .foregroundStyle(.secondary)
-                } else if liveAssistEngine.livePreviewText.isEmpty {
-                    Text("Listening…")
-                        .foregroundStyle(.secondary)
-                } else {
-                    // Rough on-device recognition, not the final transcript
-                    // — replaced by the accurate Whisper-transcribed text
-                    // as chunks upload and the server transcribes each one.
-                    Text(liveAssistEngine.livePreviewText)
-                }
-            }
-            .font(.subheadline)
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .padding(14)
-        .frame(maxWidth: .infinity, minHeight: 120, alignment: .topLeading)
-        .background(.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-    }
-
     // MARK: - Shared controls
 
     private var recordButtonBar: some View {
@@ -254,85 +199,14 @@ struct ContentView: View {
     }
 
     private var recordButton: some View {
-        Button(action: toggleRecording) {
-            Image(systemName: audioRecorder.isRecording ? "stop.circle.fill" : "record.circle.fill")
+        Button(action: startRecording) {
+            Image(systemName: "record.circle.fill")
                 .resizable()
                 .frame(width: 72, height: 72)
-                .foregroundStyle(audioRecorder.isRecording ? Color.red : Color.red.opacity(0.85))
+                .foregroundStyle(Color.red.opacity(0.85))
         }
         .buttonStyle(.plain)
-        .accessibilityLabel(audioRecorder.isRecording ? "Stop recording" : "Start recording")
-    }
-
-    private var levelMeter: some View {
-        GeometryReader { proxy in
-            RoundedRectangle(cornerRadius: 4)
-                .fill(.secondary.opacity(0.2))
-                .overlay(alignment: .leading) {
-                    RoundedRectangle(cornerRadius: 4)
-                        .fill(.red)
-                        .frame(width: proxy.size.width * CGFloat(audioRecorder.currentLevel))
-                }
-        }
-        .frame(height: 10)
-        .padding(.horizontal, 20)
-    }
-
-    private var markMomentButton: some View {
-        Button {
-            markMoment()
-        } label: {
-            Label("Mark this moment", systemImage: "bookmark.fill")
-                .font(.headline)
-        }
-        .buttonStyle(.bordered)
-    }
-
-    private var reminderBanner: some View {
-        Text("🔴 Recording — let the room know")
-            .font(.footnote.weight(.semibold))
-            .padding(.horizontal, 14)
-            .padding(.vertical, 8)
-            .background(.red.opacity(0.15), in: Capsule())
-            .padding(.top, 8)
-            .transition(.move(edge: .top).combined(with: .opacity))
-    }
-
-    private var articulateButton: some View {
-        Button {
-            showArticulateSheet = true
-        } label: {
-            Label("Articulate", systemImage: "sparkles")
-                .font(.headline)
-        }
-        .buttonStyle(.bordered)
-        .tint(.indigo)
-    }
-
-    // Tapping it goes straight to the same Articulate sheet the standing
-    // button opens — the point of the alert is "catch up fast," not just
-    // "you were notified."
-    private func attentionBanner(for keyword: String) -> some View {
-        Button {
-            attentionKeyword = nil
-            showArticulateSheet = true
-        } label: {
-            Label("\"\(keyword)\" mentioned — tap to Articulate", systemImage: "bell.badge.fill")
-                .font(.footnote.weight(.semibold))
-                .padding(.horizontal, 14)
-                .padding(.vertical, 8)
-                .background(.orange.opacity(0.2), in: Capsule())
-        }
-        .padding(.top, 8)
-        .transition(.move(edge: .top).combined(with: .opacity))
-    }
-
-    private func toggleRecording() {
-        if audioRecorder.isRecording {
-            stopRecording()
-        } else {
-            startRecording()
-        }
+        .accessibilityLabel("Start recording")
     }
 
     private func startRecording() {
@@ -408,6 +282,7 @@ struct ContentView: View {
         uploadTasks = []
         pendingChunkUploads = []
         resumeBaseOffsetSeconds = baseOffsetSeconds
+        sessionStore.activeRecordingBaseOffsetSeconds = baseOffsetSeconds
 
         audioRecorder.targetChunkSeconds = TimeInterval(settings.chunkTargetSeconds)
         audioRecorder.maxChunkSeconds = TimeInterval(settings.chunkTargetSeconds + 30)
@@ -420,11 +295,13 @@ struct ContentView: View {
             try audioRecorder.start(sessionID: UUID(), startingChunkIndex: startingChunkIndex, baseOffsetSeconds: baseOffsetSeconds) { [sessionID = session.id] chunk in
                 uploadChunk(chunk, sessionID: sessionID)
             }
+            sessionStore.activeRecordingSessionID = session.id
+            navigateToSessionID = session.id
             if settings.announceRecordingReminder {
-                withAnimation { showReminderBanner = true }
+                withAnimation { sessionStore.showReminderBanner = true }
                 Task {
                     try? await Task.sleep(nanoseconds: 4_000_000_000)
-                    withAnimation { showReminderBanner = false }
+                    withAnimation { sessionStore.showReminderBanner = false }
                 }
             }
             if settings.liveAssistEnabled {
@@ -435,6 +312,7 @@ struct ContentView: View {
             recordError = "Couldn't start recording: \(error.localizedDescription)"
             activeSession = nil
             resumeBaseOffsetSeconds = 0
+            sessionStore.activeRecordingSessionID = nil
             if deleteSessionOnFailure {
                 sessionStore.remove(id: session.id)
                 Task { _ = await routerClient.deleteSession(id: session.id, settings: settings) }
@@ -509,12 +387,12 @@ struct ContentView: View {
     }
 
     private func showAttentionAlert(for keyword: String) {
-        withAnimation { attentionKeyword = keyword }
+        withAnimation { sessionStore.attentionKeyword = keyword }
         UINotificationFeedbackGenerator().notificationOccurred(.warning)
         Task {
             try? await Task.sleep(nanoseconds: 10_000_000_000)
-            if attentionKeyword == keyword {
-                withAnimation { attentionKeyword = nil }
+            if sessionStore.attentionKeyword == keyword {
+                withAnimation { sessionStore.attentionKeyword = nil }
             }
         }
     }
@@ -572,7 +450,8 @@ struct ContentView: View {
         audioRecorder.stop()
         liveAssistEngine.stop()
         stopLivePreviewLoop()
-        attentionKeyword = nil
+        sessionStore.attentionKeyword = nil
+        sessionStore.activeRecordingSessionID = nil
         let sessionID = session.id
         // Cumulative across a resume, not just this segment — see
         // resumeBaseOffsetSeconds' own comment.
@@ -609,18 +488,6 @@ struct ContentView: View {
                 await sessionStore.refresh(settings: settings)
             }
         }
-    }
-
-    private func markMoment() {
-        guard activeSession != nil else { return }
-        pendingMarkerOffset = audioRecorder.elapsedSeconds
-        showMarkerSheet = true
-    }
-
-    private func formattedElapsed(_ seconds: TimeInterval) -> String {
-        let total = Int(seconds)
-        let h = total / 3600, m = (total % 3600) / 60, s = total % 60
-        return h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%02d:%02d", m, s)
     }
 }
 
