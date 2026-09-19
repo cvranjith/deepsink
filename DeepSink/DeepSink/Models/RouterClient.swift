@@ -112,6 +112,39 @@ final class RouterClient: ObservableObject {
 
     private let lanProbeTimeout: TimeInterval = 2.5
 
+    // Persisted across launches (UserDefaults — not sensitive, nothing
+    // this app's Settings screen exposes, just an internal cache), not
+    // only kept in memory like cachedLANURL above. Found necessary in
+    // practice: discovering the LAN address in the first place
+    // (discoverLANURL below) itself goes through Funnel, so on a cold
+    // app launch with no in-memory cache yet, a Funnel/DNS hiccup used
+    // to take LAN connectivity down with it too — even sitting on the
+    // exact same Wi-Fi as the Mac mini the whole time, with no way to
+    // learn its LAN address without reaching it over Funnel first. This
+    // is what actually breaks that dependency: re-using an already-
+    // discovered address never needs Funnel again, only ever probed
+    // directly.
+    private static let lastKnownLANURLKey = "gatewayLastKnownLANURL"
+
+    private static func loadPersistedLANURL() -> URL? {
+        guard let raw = UserDefaults.standard.string(forKey: lastKnownLANURLKey) else { return nil }
+        return URL(string: raw)
+    }
+
+    private static func persistLANURL(_ url: URL) {
+        UserDefaults.standard.set(url.absoluteString, forKey: lastKnownLANURLKey)
+    }
+
+    private func useLANCandidate(_ url: URL) -> ResolvedBase {
+        let resolved = ResolvedBase(url: url, isLAN: true)
+        cachedBase = resolved
+        cachedBaseTimestamp = Date()
+        cachedLANURL = url
+        cachedLANURLTimestamp = Date()
+        Self.persistLANURL(url)
+        return resolved
+    }
+
     private func resolveBaseURL(settings: AppSettings) async -> Result<ResolvedBase, RouterError> {
         if let cachedBase, let cachedBaseTimestamp, Date().timeIntervalSince(cachedBaseTimestamp) < baseCacheTTL {
             return .success(cachedBase)
@@ -121,20 +154,28 @@ final class RouterClient: ObservableObject {
             return .failure(settings.gatewayURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .notConfigured : .invalidURL)
         }
 
-        var lanCandidate: URL?
-        if let cachedLANURL, let cachedLANURLTimestamp, Date().timeIntervalSince(cachedLANURLTimestamp) < lanIPCacheTTL {
-            lanCandidate = cachedLANURL
-        } else if let discovered = await discoverLANURL(funnelURL: funnelURL, settings: settings) {
-            lanCandidate = discovered
-            cachedLANURL = discovered
-            cachedLANURLTimestamp = Date()
+        // Try a LAN candidate directly first, with zero Funnel
+        // involvement: the in-memory cache if it's still fresh, else
+        // whatever was persisted from a previous successful connection
+        // (possibly a previous app launch entirely). Only if neither
+        // exists, or the one we have no longer responds (DHCP moved it,
+        // or it's genuinely a different network right now), does this
+        // fall back to asking the gateway over Funnel for its current
+        // address.
+        let cachedCandidate: URL? = {
+            if let cachedLANURL, let cachedLANURLTimestamp, Date().timeIntervalSince(cachedLANURLTimestamp) < lanIPCacheTTL {
+                return cachedLANURL
+            }
+            return Self.loadPersistedLANURL()
+        }()
+
+        if let cachedCandidate, await Self.probe(cachedCandidate, timeout: lanProbeTimeout) {
+            return .success(useLANCandidate(cachedCandidate))
         }
 
-        if let lanCandidate, await Self.probe(lanCandidate, timeout: lanProbeTimeout) {
-            let resolved = ResolvedBase(url: lanCandidate, isLAN: true)
-            cachedBase = resolved
-            cachedBaseTimestamp = Date()
-            return .success(resolved)
+        if let discovered = await discoverLANURL(funnelURL: funnelURL, settings: settings),
+           await Self.probe(discovered, timeout: lanProbeTimeout) {
+            return .success(useLANCandidate(discovered))
         }
 
         let resolved = ResolvedBase(url: funnelURL, isLAN: false)
