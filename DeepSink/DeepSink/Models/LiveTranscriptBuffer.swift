@@ -30,7 +30,23 @@ final class LiveTranscriptBuffer {
     private let retentionSeconds: TimeInterval = 600
 
     func updateCurrentUtterance(text: String, offsetSeconds: TimeInterval) {
-        if isUtteranceOpen, !entries.isEmpty {
+        // Overwrite in place only when the new text is at least as long
+        // as what's already there for this open utterance - the normal
+        // case, since partials are documented to each be a longer
+        // prefix of the last. Guards against a real, observed failure
+        // mode otherwise: on-device recognition isn't reliably stable
+        // over a long continuous utterance and can silently shrink its
+        // own `bestTranscription` (an internal context-window reset)
+        // while still reporting a non-final partial - overwriting in
+        // that case would silently discard everything already
+        // recognized, which is exactly what a user reported seeing
+        // ("only the last few words show, everything before that
+        // disappeared"). Starting a new entry instead keeps it - worst
+        // case this occasionally splits one utterance into two adjacent
+        // entries when the recognizer genuinely revises a phrase
+        // shorter (rare), which just reads as mild, harmless repetition
+        // in what's already labelled a rough preview, never data loss.
+        if isUtteranceOpen, !entries.isEmpty, text.count >= entries[entries.count - 1].text.count {
             entries[entries.count - 1].text = text
         } else {
             entries.append(Entry(offsetSeconds: offsetSeconds, text: text))
