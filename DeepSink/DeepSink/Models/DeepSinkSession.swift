@@ -25,7 +25,11 @@ struct DeepSinkSession: Codable, Identifiable, Equatable {
     // "transcribing"/"summarising" split) doesn't exist server-side,
     // since transcription and note generation now happen inside the
     // gateway's own request handlers rather than as separate
-    // client-visible steps.
+    // client-visible steps. NOT a reliable "is someone still recording
+    // this" signal on its own — stage can cycle through uploading/ready
+    // multiple times *during* one ongoing recording now that notes
+    // regenerate after every chunk, not just at the end (see
+    // isRecording below, which is what actually tracks that).
     var stage: String
     var chunksDone: Int
     var chunksTotal: Int
@@ -50,6 +54,13 @@ struct DeepSinkSession: Codable, Identifiable, Equatable {
     // else (background auto-regen fires after every chunk, not just at
     // the end).
     var isGeneratingNotes: Bool
+    // True from session creation (or a Resume Recording PATCH) until
+    // /finish actually runs — the real "is this session still being
+    // recorded" signal, independent of stage's own cycling (see that
+    // field's own comment). What the web viewer's live-stream
+    // subscription keys off; SessionDetailView's own polling loop uses
+    // it too, alongside isGeneratingNotes/isDiarizing.
+    var isRecording: Bool
 }
 
 struct ServerChunk: Codable, Identifiable, Equatable {
@@ -128,8 +139,6 @@ extension DeepSinkSession {
         default: return .secondary
         }
     }
-
-    var isTerminal: Bool { stageValue == .ready || stageValue == .failed }
 
     var isDiarized: Bool { !speakers.isEmpty }
 

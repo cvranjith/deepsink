@@ -76,9 +76,13 @@ struct SessionDetailView: View {
     // device is actively feeding. Drives the polling loop below — the
     // point is "does this session still have server-side work that
     // could change what's on screen," not "is this device the one doing
-    // it."
+    // it." session.isRecording, not !session.isTerminal (stage-based) —
+    // stage alone stopped reliably meaning "still being recorded" once
+    // notes started regenerating after every chunk, not just at the
+    // end (same bug the web viewer's live-stream hit; see
+    // session_store.py's own comment on is_recording).
     private var shouldPollLive: Bool {
-        !session.isTerminal || session.isGeneratingNotes || session.isDiarizing
+        session.isRecording || session.isGeneratingNotes || session.isDiarizing
     }
 
     var body: some View {
