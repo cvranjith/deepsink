@@ -159,6 +159,24 @@ struct SessionDetailView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            // No stage check here — session.stage just reflects
+            // recording/uploading/ready/failed on the SERVER (e.g. a
+            // title-only session created ahead of time starts at
+            // "recording" with zero chunks), not whether THIS device is
+            // actively recording something right now. That guard lives
+            // centrally in ContentView.resumeRecording instead, since
+            // it's the one place that actually knows AudioRecorder's
+            // live state.
+            Button {
+                sessionStore.resumeRequest = session
+                dismiss()
+            } label: {
+                Label("Resume Recording", systemImage: "record.circle")
+                    .font(.footnote.weight(.semibold))
+            }
+            .buttonStyle(.bordered)
+            .tint(.red)
+            .padding(.top, 2)
         }
         .padding(.horizontal)
         .padding(.top, 8)

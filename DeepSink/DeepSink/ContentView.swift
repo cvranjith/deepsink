@@ -44,6 +44,19 @@ struct ContentView: View {
     @State private var uploadTasks: [Task<Void, Never>] = []
     @State private var pendingChunkUploads: [(chunk: SessionChunk, sessionID: String)] = []
 
+    // Resuming a finished session continues its chunk_index/offset
+    // sequence rather than restarting both at 0 (see AudioRecorder.start)
+    // — this is the "continue" baseline added back to this segment's own
+    // elapsedSeconds when computing the total duration sent to the
+    // server at Stop. Always 0 for a brand-new session.
+    @State private var resumeBaseOffsetSeconds: TimeInterval = 0
+
+    // Pushes LiveAssistEngine's rolling text to the server on a slow
+    // poll-for-demand / fast-push-while-watched cadence — see
+    // startLivePreviewLoop and live_preview.py's own doc comment for why
+    // this is demand-driven rather than always-on while recording.
+    @State private var livePreviewTask: Task<Void, Never>?
+
     // Capped rather than a true infinite-scroll page — this is a
     // personal app holding dozens of sessions, not thousands; "recent N
     // plus a link to the full list" gets the "don't clutter home with
@@ -122,6 +135,11 @@ struct ContentView: View {
                 Task { await sessionStore.refresh(settings: settings) }
                 retryPendingChunkUploads()
             }
+        }
+        .onChange(of: sessionStore.resumeRequest) { _, session in
+            guard let session else { return }
+            sessionStore.resumeRequest = nil
+            resumeRecording(session: session)
         }
     }
 
@@ -336,34 +354,74 @@ struct ContentView: View {
                 return
             }
             sessionStore.apply(session)
-            activeSession = session
-            uploadTasks = []
-            pendingChunkUploads = []
+            await beginRecording(session: session, startingChunkIndex: 0, baseOffsetSeconds: 0, deleteSessionOnFailure: true)
+        }
+    }
 
-            audioRecorder.targetChunkSeconds = TimeInterval(settings.chunkTargetSeconds)
-            audioRecorder.maxChunkSeconds = TimeInterval(settings.chunkTargetSeconds + 30)
+    // Continues an existing (previously stopped, possibly already
+    // "ready") session's recording instead of creating a new one — the
+    // server side already supports this for free (append_chunk doesn't
+    // care what stage a session is currently in; it just flips back to
+    // "uploading" and the next background notes regen covers the whole,
+    // combined transcript). What this needs on the phone is just picking
+    // up the chunk_index/offset sequence where it left off — see
+    // AudioRecorder.start's own comment.
+    private func resumeRecording(session: DeepSinkSession) {
+        guard !audioRecorder.isRecording else {
+            recordError = "Already recording — stop the current recording before resuming a different session."
+            return
+        }
+        Task {
+            let granted = await AVAudioApplication.requestRecordPermission()
+            guard granted else {
+                recordError = "Microphone access is off for DeepSink — enable it in iPhone Settings > Privacy > Microphone."
+                return
+            }
+            let nextChunkIndex = (session.chunks.map(\.index).max() ?? -1) + 1
+            let baseOffset = session.chunks.map { $0.startOffsetSeconds + $0.durationSeconds }.max() ?? session.durationSeconds
+            await beginRecording(session: session, startingChunkIndex: nextChunkIndex, baseOffsetSeconds: baseOffset, deleteSessionOnFailure: false)
+        }
+    }
 
-            do {
-                // AudioRecorder's own sessionID is only ever used locally
-                // to name chunk files — it doesn't need to (and, since
-                // it's typed as UUID while server session ids are plain
-                // strings, can't) match the server session's id.
-                try audioRecorder.start(sessionID: UUID()) { [sessionID = session.id] chunk in
-                    uploadChunk(chunk, sessionID: sessionID)
+    // Shared by both flows above — `deleteSessionOnFailure` is the one
+    // real difference: a session just created for a fresh recording
+    // should be cleaned up if the mic/recorder fails to actually start,
+    // but a resumed session already has real prior content and must
+    // never be deleted just because this particular resume attempt
+    // failed locally.
+    private func beginRecording(session: DeepSinkSession, startingChunkIndex: Int, baseOffsetSeconds: TimeInterval, deleteSessionOnFailure: Bool) async {
+        activeSession = session
+        uploadTasks = []
+        pendingChunkUploads = []
+        resumeBaseOffsetSeconds = baseOffsetSeconds
+
+        audioRecorder.targetChunkSeconds = TimeInterval(settings.chunkTargetSeconds)
+        audioRecorder.maxChunkSeconds = TimeInterval(settings.chunkTargetSeconds + 30)
+
+        do {
+            // AudioRecorder's own sessionID is only ever used locally to
+            // name chunk files — it doesn't need to (and, since it's
+            // typed as UUID while server session ids are plain strings,
+            // can't) match the server session's id.
+            try audioRecorder.start(sessionID: UUID(), startingChunkIndex: startingChunkIndex, baseOffsetSeconds: baseOffsetSeconds) { [sessionID = session.id] chunk in
+                uploadChunk(chunk, sessionID: sessionID)
+            }
+            if settings.announceRecordingReminder {
+                withAnimation { showReminderBanner = true }
+                Task {
+                    try? await Task.sleep(nanoseconds: 4_000_000_000)
+                    withAnimation { showReminderBanner = false }
                 }
-                if settings.announceRecordingReminder {
-                    withAnimation { showReminderBanner = true }
-                    Task {
-                        try? await Task.sleep(nanoseconds: 4_000_000_000)
-                        withAnimation { showReminderBanner = false }
-                    }
-                }
-                if settings.liveAssistEnabled {
-                    await startLiveAssistIfPossible()
-                }
-            } catch {
-                recordError = "Couldn't start recording: \(error.localizedDescription)"
-                activeSession = nil
+            }
+            if settings.liveAssistEnabled {
+                await startLiveAssistIfPossible()
+            }
+            startLivePreviewLoop(sessionID: session.id)
+        } catch {
+            recordError = "Couldn't start recording: \(error.localizedDescription)"
+            activeSession = nil
+            resumeBaseOffsetSeconds = 0
+            if deleteSessionOnFailure {
                 sessionStore.remove(id: session.id)
                 Task { _ = await routerClient.deleteSession(id: session.id, settings: settings) }
             }
@@ -396,6 +454,44 @@ struct ContentView: View {
         } catch {
             liveAssistError = "Live Assist couldn't start, so the live preview and attention keywords won't work for this recording: \(error.localizedDescription)"
         }
+    }
+
+    // Demand-driven, not always-on: polls whether anyone's actually
+    // watching this session's Transcript tab on the web viewer right now
+    // (cheap, slow cadence) and only pushes LiveAssistEngine's rolling
+    // text (a real network call every ~1.5s) while that's true — see
+    // live_preview.py's own doc comment for the full reasoning. Requires
+    // Live Assist to be on (it's the only source of on-device text this
+    // pulls from); does nothing at all otherwise.
+    private func startLivePreviewLoop(sessionID: String) {
+        livePreviewTask?.cancel()
+        guard settings.liveAssistEnabled else { return }
+        livePreviewTask = Task {
+            var lastPushedText: String?
+            while !Task.isCancelled {
+                guard liveAssistEngine.isRunning else {
+                    try? await Task.sleep(nanoseconds: 5_000_000_000)
+                    continue
+                }
+                let viewers = await routerClient.liveViewerCount(sessionID: sessionID, settings: settings)
+                guard !Task.isCancelled else { return }
+                if viewers > 0 {
+                    let text = liveAssistEngine.recentTranscript(seconds: 20)
+                    if text != lastPushedText {
+                        await routerClient.postLivePreview(sessionID: sessionID, text: text, settings: settings)
+                        lastPushedText = text
+                    }
+                    try? await Task.sleep(nanoseconds: 1_500_000_000)
+                } else {
+                    try? await Task.sleep(nanoseconds: 5_000_000_000)
+                }
+            }
+        }
+    }
+
+    private func stopLivePreviewLoop() {
+        livePreviewTask?.cancel()
+        livePreviewTask = nil
     }
 
     private func showAttentionAlert(for keyword: String) {
@@ -461,11 +557,15 @@ struct ContentView: View {
         guard let session = activeSession else { return }
         audioRecorder.stop()
         liveAssistEngine.stop()
+        stopLivePreviewLoop()
         attentionKeyword = nil
         let sessionID = session.id
-        let duration = audioRecorder.elapsedSeconds
+        // Cumulative across a resume, not just this segment — see
+        // resumeBaseOffsetSeconds' own comment.
+        let duration = resumeBaseOffsetSeconds + audioRecorder.elapsedSeconds
         let incomplete = audioRecorder.recordingIncomplete
         activeSession = nil
+        resumeBaseOffsetSeconds = 0
         navigateToSessionID = sessionID
 
         Task {

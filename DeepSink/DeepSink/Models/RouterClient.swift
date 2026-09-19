@@ -372,6 +372,26 @@ final class RouterClient: ObservableObject {
         decodeSessionResult(await restRequest(method: "POST", path: "deepsink/sessions/\(id)/diarize", body: nil, settings: settings, timeout: 1800))
     }
 
+    // MARK: - Live preview (demand-driven — see live_preview.py's own doc)
+    //
+    // The phone polls `liveViewerCount` on a slow cadence while recording
+    // and only starts calling `postLivePreview` (on a fast cadence) once
+    // it sees a real number there — no point pushing on-device text to a
+    // session nobody's watching in the web viewer's Transcript tab.
+
+    func liveViewerCount(sessionID: String, settings: AppSettings) async -> Int {
+        let result = await restRequest(method: "GET", path: "deepsink/sessions/\(sessionID)/live_preview/viewers", body: nil, settings: settings, timeout: 15)
+        guard case .success(let data) = result,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return 0
+        }
+        return json["viewers"] as? Int ?? 0
+    }
+
+    func postLivePreview(sessionID: String, text: String, settings: AppSettings) async {
+        _ = await restRequest(method: "POST", path: "deepsink/sessions/\(sessionID)/live_preview", body: ["text": text], settings: settings, timeout: 15)
+    }
+
     private func decodeSessionResult(_ result: Result<Data, RouterError>) -> Result<DeepSinkSession, RouterError> {
         switch result {
         case .success(let data):

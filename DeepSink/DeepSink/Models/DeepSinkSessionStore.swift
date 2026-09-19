@@ -18,6 +18,15 @@ final class DeepSinkSessionStore: ObservableObject {
     @Published private(set) var sessions: [DeepSinkSession] = []
     @Published var lastError: String?
 
+    // A cross-screen trigger, not session data: SessionDetailView sets
+    // this and dismisses itself; ContentView (the only place that owns
+    // AudioRecorder/LiveAssistEngine and knows how to actually start a
+    // recording) observes it via `.onChange` and starts one continuing
+    // this session rather than creating a new one. Using the shared
+    // store for this (instead of, say, a NavigationPath binding) means
+    // it works regardless of how deep SessionDetailView was pushed.
+    @Published var resumeRequest: DeepSinkSession?
+
     private let routerClient: RouterClient
 
     init(routerClient: RouterClient) {

@@ -55,12 +55,22 @@ final class AudioRecorder: NSObject, ObservableObject {
         return dir
     }()
 
-    func start(sessionID: UUID, onChunkFinished: @escaping (SessionChunk) -> Void) throws {
+    // `startingChunkIndex`/`baseOffsetSeconds` are for resuming a
+    // previously-finished session's recording (see ContentView's
+    // resumeRecording): continuing the chunk_index/offset sequence
+    // rather than restarting both at 0 is what keeps new chunk files
+    // from overwriting old ones with the same name, and keeps the new
+    // transcript blocks' timestamps after the existing ones instead of
+    // overlapping them. `elapsedSeconds` itself still starts fresh at 0
+    // either way — it's this recording segment's own on-screen timer,
+    // not the session's cumulative duration (the caller adds
+    // `baseOffsetSeconds` back in when it computes that for the server).
+    func start(sessionID: UUID, startingChunkIndex: Int = 0, baseOffsetSeconds: TimeInterval = 0, onChunkFinished: @escaping (SessionChunk) -> Void) throws {
         try configureSession()
         self.sessionID = sessionID
         self.onChunkFinished = onChunkFinished
-        currentChunkIndex = 0
-        currentChunkStartOffset = 0
+        currentChunkIndex = startingChunkIndex
+        currentChunkStartOffset = baseOffsetSeconds
         sessionStartDate = Date()
         elapsedSeconds = 0
         recordingIncomplete = false
