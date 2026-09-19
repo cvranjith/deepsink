@@ -303,8 +303,13 @@ final class RouterClient: ObservableObject {
         }
     }
 
-    func createSession(title: String, settings: AppSettings) async -> Result<DeepSinkSession, RouterError> {
-        decodeSessionResult(await restRequest(method: "POST", path: "deepsink/sessions", body: ["title": title], settings: settings, timeout: 30))
+    // `isRecording` defaults false (a plain "prepare a session" call,
+    // e.g. one day this app's own "create ahead of time" flow) - always
+    // true from ContentView's actual recording-start path, the only
+    // caller that has any business creating a session that immediately
+    // looks like it's being recorded.
+    func createSession(title: String, isRecording: Bool = false, settings: AppSettings) async -> Result<DeepSinkSession, RouterError> {
+        decodeSessionResult(await restRequest(method: "POST", path: "deepsink/sessions", body: ["title": title, "is_recording": isRecording], settings: settings, timeout: 30))
     }
 
     func getSession(id: String, settings: AppSettings) async -> Result<DeepSinkSession, RouterError> {
