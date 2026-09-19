@@ -372,6 +372,16 @@ final class RouterClient: ObservableObject {
         decodeSessionResult(await restRequest(method: "POST", path: "deepsink/sessions/\(id)/diarize", body: nil, settings: settings, timeout: 1800))
     }
 
+    // Renaming isn't just cosmetic server-side — it's the roster
+    // enrollment step (see speaker_roster.py): the server saves this
+    // name against that speaker's voice embedding from this session, so
+    // a later Detect Speakers run (this session or another) can
+    // recognize the same voice automatically instead of defaulting back
+    // to "Person N".
+    func renameSpeaker(sessionID: String, speakerID: String, displayName: String, settings: AppSettings) async -> Result<DeepSinkSession, RouterError> {
+        decodeSessionResult(await restRequest(method: "PATCH", path: "deepsink/sessions/\(sessionID)/speakers/\(speakerID)", body: ["display_name": displayName], settings: settings, timeout: 30))
+    }
+
     // MARK: - Live preview (demand-driven — see live_preview.py's own doc)
     //
     // The phone polls `liveViewerCount` on a slow cadence while recording

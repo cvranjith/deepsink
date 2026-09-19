@@ -47,6 +47,8 @@ struct SessionDetailView: View {
     @State private var actionErrorMessage: String?
     @State private var diarizationErrorMessage: String?
     @State private var notesSaveTask: Task<Void, Never>?
+    @State private var renamingSpeaker: SessionSpeaker?
+    @State private var renameText = ""
 
     init(session: DeepSinkSession) {
         _session = State(initialValue: session)
@@ -105,6 +107,19 @@ struct SessionDetailView: View {
             Button("OK", role: .cancel) {}
         } message: {
             Text(actionErrorMessage ?? "")
+        }
+        .alert("Rename Speaker", isPresented: Binding(
+            get: { renamingSpeaker != nil },
+            set: { if !$0 { renamingSpeaker = nil } }
+        )) {
+            TextField("Name", text: $renameText)
+            Button("Cancel", role: .cancel) { renamingSpeaker = nil }
+            Button("Save") {
+                if let speaker = renamingSpeaker { renameSpeaker(speaker) }
+                renamingSpeaker = nil
+            }
+        } message: {
+            Text("Also teaches the server to recognize this voice automatically in future sessions.")
         }
         .task {
             // The list/card this view was pushed from may be showing a
@@ -277,17 +292,24 @@ struct SessionDetailView: View {
             if session.isDiarized {
                 Section {
                     ForEach(session.speakers) { speaker in
-                        Text(speaker.displayName)
+                        Button {
+                            renamingSpeaker = speaker
+                            renameText = speaker.displayName
+                        } label: {
+                            HStack {
+                                Text(speaker.displayName)
+                                    .foregroundStyle(.primary)
+                                Spacer()
+                                Image(systemName: "pencil")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
                     }
                 } header: {
                     Text("Speakers")
                 } footer: {
-                    // Renaming isn't wired up in this pass: the server has
-                    // no endpoint to persist a speaker rename (PATCH on a
-                    // session only accepts title/background_notes/
-                    // duration_seconds/recording_incomplete) — see
-                    // SessionSpeaker's own comment.
-                    Text("Speaker names are assigned automatically and can't be renamed yet.")
+                    Text("Tap a name to rename it — this also teaches the server to recognize that voice automatically in future sessions.")
                 }
             }
             if !session.markers.isEmpty {
@@ -416,6 +438,21 @@ struct SessionDetailView: View {
                 if let index = session.actionItems.firstIndex(where: { $0.id == item.id }) {
                     session.actionItems[index].isChecked = !newValue
                 }
+                actionErrorMessage = error.message
+            }
+        }
+    }
+
+    private func renameSpeaker(_ speaker: SessionSpeaker) {
+        let newName = renameText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !newName.isEmpty, newName != speaker.displayName else { return }
+        Task {
+            let result = await routerClient.renameSpeaker(sessionID: session.id, speakerID: speaker.id, displayName: newName, settings: settings)
+            switch result {
+            case .success(let updated):
+                session = updated
+                sessionStore.apply(updated)
+            case .failure(let error):
                 actionErrorMessage = error.message
             }
         }
