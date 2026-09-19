@@ -8,41 +8,16 @@ import SwiftUI
 struct SettingsView: View {
     @EnvironmentObject var settings: AppSettings
     @EnvironmentObject var routerClient: RouterClient
-    @State private var isTestingConnection = false
-    @State private var connectionMessage: String?
     @State private var isTestingLogin = false
     @State private var loginMessage: String?
 
     var body: some View {
         Form {
             Section {
-                TextField("http://Ranjiths-Mac-mini.local:8788", text: $settings.gatewayLANURL)
+                TextField("https://<name>.ts.net/gateway", text: $settings.gatewayURL)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
                     .keyboardType(.URL)
-                TextField("https://<name>.ts.net/gateway", text: $settings.gatewayFunnelURL)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .keyboardType(.URL)
-                TextField("Client ID", text: $settings.gatewayClientID)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                SecureField("Client secret", text: $settings.gatewayClientSecret)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                Button {
-                    Task { await testConnection() }
-                } label: {
-                    if isTestingConnection { ProgressView() } else { Text("Test Connection") }
-                }
-                .disabled(isTestingConnection)
-            } header: {
-                Text("AI Gateway (Mac mini)")
-            } footer: {
-                Text("Talks to the Mac mini directly — no Cloudflare hop. The LAN address is tried first (fast, same Wi-Fi only) and the Funnel address is the fallback when you're away from home. Client ID/secret gate the AI calls (Articulate, Update App) — a credential this app registers for itself, not a shared token. Session data itself uses a separate login below.")
-            }
-
-            Section {
                 TextField("DeepSink user ID", text: $settings.deepSinkUserID)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
@@ -54,9 +29,9 @@ struct SettingsView: View {
                 }
                 .disabled(isTestingLogin)
             } header: {
-                Text("DeepSink Login")
+                Text("Mac Mini")
             } footer: {
-                Text("A separate login (not the router token above) — this is whose session folder recordings, transcripts, and notes are stored under on the Mac mini. The password is stored in Keychain, never in plain settings.")
+                Text("The one address to enter — its Tailscale Funnel URL, always reachable. When you're on the same Wi-Fi, the app finds the Mac mini's local address on its own (by asking the gateway, over this same URL, what its own address currently is) and prefers that for speed — nothing to configure for that part. The password is stored in Keychain, never in plain settings.")
             }
 
             Section {
@@ -144,25 +119,10 @@ struct SettingsView: View {
             }
         }
         .navigationTitle("Settings")
-        .alert("Router", isPresented: Binding(get: { connectionMessage != nil }, set: { if !$0 { connectionMessage = nil } })) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text(connectionMessage ?? "")
-        }
         .alert("DeepSink Login", isPresented: Binding(get: { loginMessage != nil }, set: { if !$0 { loginMessage = nil } })) {
             Button("OK", role: .cancel) {}
         } message: {
             Text(loginMessage ?? "")
-        }
-    }
-
-    private func testConnection() async {
-        isTestingConnection = true
-        let result = await routerClient.testConnection(settings: settings)
-        isTestingConnection = false
-        switch result {
-        case .success: connectionMessage = "Connected successfully."
-        case .failure(let error): connectionMessage = error.message
         }
     }
 

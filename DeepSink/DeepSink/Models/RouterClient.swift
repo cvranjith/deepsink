@@ -18,10 +18,10 @@ enum RouterError: Error {
 
     var message: String {
         switch self {
-        case .notConfigured: return "Set the Mac mini's LAN/Funnel URL and client credentials in Settings."
-        case .invalidURL: return "One of the gateway URLs in Settings doesn't look valid."
+        case .notConfigured: return "Set the Mac mini's gateway URL and DeepSink login in Settings."
+        case .invalidURL: return "The gateway URL in Settings doesn't look valid."
         case .network(let error): return "Couldn't reach the Mac mini: \(error.localizedDescription)"
-        case .unauthorized: return "The gateway rejected this client — check the client ID/secret in Settings."
+        case .unauthorized: return "The gateway rejected this login — check the user ID/password in Settings."
         case .loginFailed(let message): return message
         case .server(let message): return message
         case .decoding: return "Got an unexpected response from the Mac mini."
@@ -50,82 +50,126 @@ struct RouterDeployStatusInfo {
 // other backends, one client), so it's been cut from DeepSink's path
 // entirely (yt-run still uses it for its own purposes — untouched).
 //
-// Every call here first resolves a base URL via `resolveBaseURL`: the
-// Mac mini's LAN address (its own Bonjour hostname, fast, no internet
-// hop) when reachable, falling back to its Tailscale Funnel URL
-// otherwise — see that function's own comment for the probe/cache/
-// fallback design. Two request shapes live here side by side, each with
-// its own auth, both against whichever base URL that resolves to:
+// One credential for everything: DeepSink's own user_id/password (see
+// `sessionToken` below), exchanged for a JWT that authenticates both
+// request shapes this type makes, against whichever base URL
+// `resolveBaseURL` currently resolves to:
 //   - `invoke(...)` — ai-gateway's own `/invoke` envelope
 //     (`{service_id, params}` -> `{result}`), used by `articulate` and
 //     the deploy calls, both genuinely stateless AI/action calls.
-//     Authenticated with an OAuth2 Client Credentials token (`clientToken`
-//     below), fetched from `/oauth/token` using `settings.gatewayClientID`/
-//     `gatewayClientSecret` — this app's own registered ai-gateway client,
-//     where ai-router used to hold and exchange one on its behalf.
+//     ai-gateway's `/invoke` accepts this same user token as an
+//     alternative to its OAuth2 Client Credentials grant (see
+//     `gateway.py`'s `require_client_or_user`) specifically so DeepSink
+//     doesn't need a second, separate registered client just for these.
 //   - `restRequest(...)` — plain REST against `/deepsink/sessions/*`
 //     (ai-gateway's own session store; see that project's README). This
 //     is real, stateful CRUD, not an AI call, so it isn't forced into the
 //     invoke envelope — method/path/body/status all pass through as-is,
 //     and every write endpoint returns the full, current session.
-//     Authenticated with a separate, human DeepSink user_id/password (see
-//     `sessionToken` below) — that credential scopes data to one user's
-//     own folder on the Mac mini, which the client-credentials token above
-//     has no concept of (it just says "this is a legitimate DeepSink
-//     install," not "this is <user>'s data").
 final class RouterClient: ObservableObject {
 
     // MARK: - Base URL resolution (LAN-preferred, Funnel-fallback)
     //
-    // Probed rather than inferred from SSID: matching the phone's own
-    // Wi-Fi network name would need the "Access WiFi Information"
-    // entitlement and still wouldn't prove the Mac mini is actually
-    // reachable (same SSID elsewhere, subnet isolation, the Mac asleep).
-    // A short, direct `/health` request against the LAN URL answers the
-    // only question that actually matters — "can I reach it right now" —
-    // with no extra permissions. The result is cached briefly so a whole
-    // burst of calls (e.g. chunk upload immediately followed by a session
-    // refetch) doesn't re-probe for each one; a real request failure
-    // against a cached LAN choice invalidates the cache and retries once
-    // against Funnel immediately, rather than waiting out the TTL while
-    // stuck on a base URL that just stopped working (e.g. walking out of
-    // Wi-Fi range mid-session).
+    // Only one URL is configured (`settings.gatewayURL`, the Mac mini's
+    // Tailscale Funnel address) — the LAN address isn't a setting at all.
+    // It's discovered at runtime by asking the gateway itself, over that
+    // same Funnel URL, what its own current local IP is (`mac_deploy`'s
+    // `wifi_status` action — already existed for the Update App screen).
+    // That discovery call is pinned directly to the Funnel URL rather
+    // than going through `resolveBaseURL`/`invoke` (which would be
+    // circular — the whole point is finding out whether a LAN URL exists
+    // yet), and its result is cached for a few minutes (`lanIPCacheTTL`)
+    // since a home DHCP lease doesn't move often and it's a real network
+    // round trip. The IP is combined with the fixed port ai-gateway
+    // itself listens on (`gatewayLANPort` — hardcoded in `gateway.py`,
+    // not something that varies) to get a candidate LAN URL, which is
+    // then probed directly (`/health`, short timeout) — the probe is what
+    // actually decides LAN-vs-Funnel for a given call, not network-name
+    // matching, so it stays correct even if the cached IP is stale (the
+    // probe just fails and this falls back to Funnel, same as if LAN had
+    // never been discovered at all). The LAN-vs-Funnel *choice* itself is
+    // cached even more briefly (`baseCacheTTL`) so a burst of calls
+    // doesn't re-probe for each one; a real request failure against a
+    // cached LAN choice invalidates that cache and retries once against
+    // Funnel immediately, rather than waiting out the TTL while stuck on
+    // a base URL that just stopped working (e.g. walking out of Wi-Fi
+    // range mid-session).
 
     private struct ResolvedBase {
         let url: URL
         let isLAN: Bool
     }
 
+    private static let gatewayLANPort = 8788
+
     private var cachedBase: ResolvedBase?
     private var cachedBaseTimestamp: Date?
     private let baseCacheTTL: TimeInterval = 30
+
+    private var cachedLANURL: URL?
+    private var cachedLANURLTimestamp: Date?
+    private let lanIPCacheTTL: TimeInterval = 300
+
     private let lanProbeTimeout: TimeInterval = 2.5
 
-    private func resolveBaseURL(settings: AppSettings, forceFresh: Bool = false) async -> Result<ResolvedBase, RouterError> {
-        if !forceFresh, let cachedBase, let cachedBaseTimestamp, Date().timeIntervalSince(cachedBaseTimestamp) < baseCacheTTL {
+    private func resolveBaseURL(settings: AppSettings) async -> Result<ResolvedBase, RouterError> {
+        if let cachedBase, let cachedBaseTimestamp, Date().timeIntervalSince(cachedBaseTimestamp) < baseCacheTTL {
             return .success(cachedBase)
         }
 
-        let lan = settings.gatewayLANURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        let funnel = settings.gatewayFunnelURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !lan.isEmpty || !funnel.isEmpty else { return .failure(.notConfigured) }
-
-        if !lan.isEmpty, let lanURL = Self.normalizedURL(lan) {
-            if await Self.probe(lanURL, timeout: lanProbeTimeout) {
-                let resolved = ResolvedBase(url: lanURL, isLAN: true)
-                cachedBase = resolved
-                cachedBaseTimestamp = Date()
-                return .success(resolved)
-            }
+        guard let funnelURL = Self.normalizedURL(settings.gatewayURL) else {
+            return .failure(settings.gatewayURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .notConfigured : .invalidURL)
         }
 
-        guard let funnelURL = Self.normalizedURL(funnel) else {
-            return .failure(funnel.isEmpty ? .notConfigured : .invalidURL)
+        var lanCandidate: URL?
+        if let cachedLANURL, let cachedLANURLTimestamp, Date().timeIntervalSince(cachedLANURLTimestamp) < lanIPCacheTTL {
+            lanCandidate = cachedLANURL
+        } else if let discovered = await discoverLANURL(funnelURL: funnelURL, settings: settings) {
+            lanCandidate = discovered
+            cachedLANURL = discovered
+            cachedLANURLTimestamp = Date()
         }
+
+        if let lanCandidate, await Self.probe(lanCandidate, timeout: lanProbeTimeout) {
+            let resolved = ResolvedBase(url: lanCandidate, isLAN: true)
+            cachedBase = resolved
+            cachedBaseTimestamp = Date()
+            return .success(resolved)
+        }
+
         let resolved = ResolvedBase(url: funnelURL, isLAN: false)
         cachedBase = resolved
         cachedBaseTimestamp = Date()
         return .success(resolved)
+    }
+
+    // Asks the gateway (over Funnel — always reachable, unlike the thing
+    // being discovered) for its own current LAN IP via `mac_deploy`'s
+    // `wifi_status` action, the same call the Update App screen already
+    // uses for its own display purposes. A minimal, direct request rather
+    // than reusing `invoke()`/`deployWifiStatus()`: those go through
+    // `resolveBaseURL`, which is what's calling this in the first place.
+    private func discoverLANURL(funnelURL: URL, settings: AppSettings) async -> URL? {
+        guard case .success(let token) = await sessionToken(baseURL: funnelURL, settings: settings) else { return nil }
+
+        var request = URLRequest(url: funnelURL.appendingPathComponent("invoke"))
+        request.httpMethod = "POST"
+        request.timeoutInterval = 15
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "service_id": "mac_deploy",
+            "params": ["action": "wifi_status", "project": "deepsink"],
+        ])
+
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              (response as? HTTPURLResponse).map({ (200...299).contains($0.statusCode) }) == true,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let result = json["result"] as? [String: Any],
+              let ip = result["ip"] as? String, !ip.isEmpty else {
+            return nil
+        }
+        return URL(string: "http://\(ip):\(Self.gatewayLANPort)")
     }
 
     private static func probe(_ baseURL: URL, timeout: TimeInterval) async -> Bool {
@@ -147,64 +191,14 @@ final class RouterClient: ObservableObject {
         return URL(string: trimmed)
     }
 
-    // MARK: - ai-gateway OAuth2 Client Credentials (for `/invoke`)
-
-    private var cachedClientToken: String?
-    private var cachedClientTokenExpiry: Date?
-
-    private func clientToken(baseURL: URL, settings: AppSettings) async -> Result<String, RouterError> {
-        if let cachedClientToken, let cachedClientTokenExpiry, cachedClientTokenExpiry > Date() {
-            return .success(cachedClientToken)
-        }
-
-        let clientID = settings.gatewayClientID.trimmingCharacters(in: .whitespacesAndNewlines)
-        let clientSecret = settings.gatewayClientSecret
-        guard !clientID.isEmpty, !clientSecret.isEmpty else { return .failure(.notConfigured) }
-
-        var request = URLRequest(url: baseURL.appendingPathComponent("oauth/token"))
-        request.httpMethod = "POST"
-        request.timeoutInterval = 20
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try? JSONSerialization.data(withJSONObject: ["client_id": clientID, "client_secret": clientSecret])
-
-        let data: Data
-        let response: URLResponse
-        do {
-            (data, response) = try await URLSession.shared.data(for: request)
-        } catch {
-            return .failure(.network(error))
-        }
-
-        guard let http = response as? HTTPURLResponse,
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return .failure(.decoding)
-        }
-        guard (200...299).contains(http.statusCode),
-              let accessToken = json["access_token"] as? String,
-              let expiresIn = json["expires_in"] as? Double else {
-            if http.statusCode == 401 { return .failure(.unauthorized) }
-            let message = (json["error_description"] as? String) ?? (json["error"] as? String)
-                ?? "Sign-in failed — check the client ID/secret in Settings."
-            return .failure(.loginFailed(message))
-        }
-
-        cachedClientToken = accessToken
-        // 1-hour token — refresh 5 minutes ahead rather than the ~1-hour
-        // margin the (~1-week) session token uses below, so this doesn't
-        // effectively never refresh.
-        cachedClientTokenExpiry = Date().addingTimeInterval(expiresIn - 300)
-        return .success(accessToken)
-    }
-
-    // MARK: - DeepSink session login (for `/deepsink/sessions/*`)
+    // MARK: - DeepSink session login (the one credential for everything)
     //
-    // A separate, human user_id/password (ai-gateway's user_auth.py),
-    // independent of the client-credentials token above — that one just
-    // says "this is a legitimate DeepSink install"; this one says "this
-    // is <user>'s own session data" and scopes every /deepsink/sessions/*
-    // call to that user's folder on the Mac mini. Cached in memory only
-    // (never persisted — re-login on a cold launch is one cheap call),
-    // refreshed a little ahead of its real ~1-week expiry.
+    // Cached in memory only (never persisted — re-login on a cold launch
+    // is one cheap call), refreshed a little ahead of its real ~1-week
+    // expiry — in practice this never surfaces as a visible "log back in"
+    // moment, since every call transparently re-authenticates from the
+    // user_id/password already in Settings/Keychain whenever the cached
+    // token is missing or stale.
 
     private var cachedSessionToken: String?
     private var cachedSessionTokenExpiry: Date?
@@ -390,24 +384,6 @@ final class RouterClient: ObservableObject {
         }
     }
 
-    // Sends a deliberately unknown service ID and reads the *shape* of
-    // the rejection: a 401 means the client credentials themselves were
-    // rejected; a 400 whose message names an unknown service_id means
-    // the credentials were accepted and this got as far as service
-    // routing — ai-gateway's own /invoke reports that as
-    // `{"error": "unknown service_id '...' - known: [...]"}"`.
-    func testConnection(settings: AppSettings) async -> Result<Void, RouterError> {
-        switch await invoke(serviceID: "__ping__", params: [:], settings: settings, timeout: 15) {
-        case .success:
-            return .success(())
-        case .failure(let error):
-            if case .server(let message) = error, message.contains("unknown service_id") {
-                return .success(())
-            }
-            return .failure(error)
-        }
-    }
-
     // A short, recent transcript excerpt (typically the last few
     // minutes, from LiveAssistEngine's on-device recognition — not the
     // full accurate transcript) in, quick bullets + a spoken-style draft
@@ -485,7 +461,7 @@ final class RouterClient: ObservableObject {
             return .failure(.decoding)
         }
 
-        let tokenResult = await clientToken(baseURL: base.url, settings: settings)
+        let tokenResult = await sessionToken(baseURL: base.url, settings: settings)
         guard case .success(let token) = tokenResult else {
             if case .failure(let error) = tokenResult { return .failure(error) }
             return .failure(.decoding)
@@ -520,8 +496,8 @@ final class RouterClient: ObservableObject {
 
         guard let http = response as? HTTPURLResponse else { return .failure(.decoding) }
         if http.statusCode == 401 {
-            cachedClientToken = nil
-            cachedClientTokenExpiry = nil
+            cachedSessionToken = nil
+            cachedSessionTokenExpiry = nil
             return .failure(.unauthorized)
         }
 
