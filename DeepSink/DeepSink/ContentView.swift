@@ -377,9 +377,23 @@ struct ContentView: View {
                 recordError = "Microphone access is off for DeepSink — enable it in iPhone Settings > Privacy > Microphone."
                 return
             }
-            let nextChunkIndex = (session.chunks.map(\.index).max() ?? -1) + 1
-            let baseOffset = session.chunks.map { $0.startOffsetSeconds + $0.durationSeconds }.max() ?? session.durationSeconds
-            await beginRecording(session: session, startingChunkIndex: nextChunkIndex, baseOffsetSeconds: baseOffset, deleteSessionOnFailure: false)
+            // The server otherwise has no way to know recording has
+            // resumed until the first new chunk actually lands -
+            // live_preview's viewer-facing gating and the web viewer's
+            // progressive polling both key off stage being "recording"/
+            // "uploading" (see deepsink_sessions.py's patch_session), so
+            // this session would silently look finished/non-live for
+            // however long that first chunk takes otherwise. Best-effort:
+            // proceeds with recording either way if this call fails, just
+            // without that immediate live-facing update.
+            var resumedSession = session
+            if case .success(let updated) = await routerClient.updateSession(id: session.id, fields: ["stage": "recording"], settings: settings) {
+                resumedSession = updated
+                sessionStore.apply(updated)
+            }
+            let nextChunkIndex = (resumedSession.chunks.map(\.index).max() ?? -1) + 1
+            let baseOffset = resumedSession.chunks.map { $0.startOffsetSeconds + $0.durationSeconds }.max() ?? resumedSession.durationSeconds
+            await beginRecording(session: resumedSession, startingChunkIndex: nextChunkIndex, baseOffsetSeconds: baseOffset, deleteSessionOnFailure: false)
         }
     }
 
