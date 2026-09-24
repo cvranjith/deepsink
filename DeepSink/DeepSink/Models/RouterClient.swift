@@ -344,6 +344,28 @@ final class RouterClient: ObservableObject {
         }
     }
 
+    private struct ActionItemsResponse: Decodable {
+        var actionItems: [OutstandingActionItem]
+    }
+
+    // Always fetches everything (including done) and lets the dashboard
+    // filter client-side - avoids a second round trip just to flip a
+    // "show completed" toggle, since this list is small enough (a
+    // personal app's own lifetime of sessions) that filtering in memory
+    // is free.
+    func listOutstandingActionItems(settings: AppSettings) async -> Result<[OutstandingActionItem], RouterError> {
+        let result = await restRequest(method: "GET", path: "deepsink/action_items", body: nil, settings: settings, timeout: 30, query: ["include_done": "1"])
+        switch result {
+        case .success(let data):
+            guard let wrapper = try? Self.sessionDecoder.decode(ActionItemsResponse.self, from: data) else {
+                return .failure(.decoding)
+            }
+            return .success(wrapper.actionItems)
+        case .failure(let error):
+            return .failure(error)
+        }
+    }
+
     // `isRecording` defaults false (a plain "prepare a session" call,
     // e.g. one day this app's own "create ahead of time" flow) - always
     // true from ContentView's actual recording-start path, the only
@@ -606,7 +628,8 @@ final class RouterClient: ObservableObject {
         path: String,
         body: [String: Any]?,
         settings: AppSettings,
-        timeout: TimeInterval
+        timeout: TimeInterval,
+        query: [String: String]? = nil
     ) async -> Result<Data, RouterError> {
         let baseResult = await resolveBaseURL(settings: settings)
         guard case .success(let base) = baseResult else {
@@ -623,7 +646,17 @@ final class RouterClient: ObservableObject {
             return .failure(.decoding)
         }
 
-        var request = URLRequest(url: base.url.appendingPathComponent(path))
+        // appendingPathComponent would percent-escape a literal "?" rather
+        // than treat it as a query separator, so a query string needs
+        // URLComponents instead - every other caller passes query: nil and
+        // gets the plain appendingPathComponent behavior unchanged.
+        var url = base.url.appendingPathComponent(path)
+        if let query, !query.isEmpty {
+            var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+            components?.queryItems = query.map { URLQueryItem(name: $0.key, value: $0.value) }
+            url = components?.url ?? url
+        }
+        var request = URLRequest(url: url)
         request.httpMethod = method
         request.timeoutInterval = timeout
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -641,7 +674,7 @@ final class RouterClient: ObservableObject {
             if base.isLAN {
                 cachedBase = nil
                 cachedBaseTimestamp = nil
-                return await restRequest(method: method, path: path, body: body, settings: settings, timeout: timeout)
+                return await restRequest(method: method, path: path, body: body, settings: settings, timeout: timeout, query: query)
             }
             return .failure(.network(error))
         }

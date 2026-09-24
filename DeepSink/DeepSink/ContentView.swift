@@ -87,6 +87,13 @@ struct ContentView: View {
                     }
                     ToolbarItem(placement: .navigationBarTrailing) {
                         NavigationLink {
+                            OutstandingActionsView()
+                        } label: {
+                            Image(systemName: "checklist")
+                        }
+                    }
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        NavigationLink {
                             SettingsView()
                         } label: {
                             Image(systemName: "gearshape")

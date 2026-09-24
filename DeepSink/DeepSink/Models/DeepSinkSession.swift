@@ -81,6 +81,25 @@ struct ServerActionItem: Codable, Identifiable, Equatable {
     var sortOrder: Int
 }
 
+// One row of GET /deepsink/action_items - the cross-session "outstanding
+// action items" rollup (see that route's own comment in
+// deepsink_sessions.py). Deliberately a separate type from
+// ServerActionItem rather than reusing it plus a tacked-on session_id:
+// this is what the dashboard actually renders, and every mutation
+// (toggle, edit owner/due) round-trips through the same per-item PATCH
+// endpoint the session detail view's Actions tab already uses.
+struct OutstandingActionItem: Codable, Identifiable, Equatable {
+    var id: String
+    var text: String
+    var owner: String?
+    var due: String?
+    var isChecked: Bool
+    var sortOrder: Int
+    var sessionId: String
+    var sessionTitle: String
+    var sessionStartedAt: Date?
+}
+
 struct ServerMarker: Codable, Identifiable, Equatable {
     var id: String
     var offsetSeconds: Double
