@@ -349,9 +349,10 @@ struct ContentView: View {
             }
         }
         do {
-            try liveAssistEngine.start(keywords: settings.attentionKeywords)
+            try await liveAssistEngine.start(keywords: settings.attentionKeywords)
         } catch {
-            liveAssistError = "Live Assist couldn't start, so the live preview and attention keywords won't work for this recording: \(error.localizedDescription)"
+            let detail = (error as? LiveAssistError)?.message ?? error.localizedDescription
+            liveAssistError = "Live Assist couldn't start, so the live preview and attention keywords won't work for this recording: \(detail)"
         }
     }
 

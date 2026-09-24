@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		66880E4A34D4B1928CACAFEF /* WhisperKit in Frameworks */ = {isa = PBXBuildFile; productRef = 9A5047A2CC7E81D6B1F2D0F9 /* WhisperKit */; };
 		ED810174F3D5EA19DD4D295A /* WidgetKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 834FFA905C693842A4A8DD19 /* WidgetKit.framework */; };
 		9E8BA292F2845BC2CF663A63 /* SwiftUI.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = E1EE0FEAE623E8173A724378 /* SwiftUI.framework */; };
 		9CE0A451BCB42A77770D9FB4 /* DeepSinkActivityExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 6AA32C4096247C102D4635A6 /* DeepSinkActivityExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
@@ -92,6 +93,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				66880E4A34D4B1928CACAFEF /* WhisperKit in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -157,6 +159,7 @@
 			);
 			name = DeepSink;
 			packageProductDependencies = (
+				9A5047A2CC7E81D6B1F2D0F9 /* WhisperKit */,
 			);
 			productName = DeepSink;
 			productReference = 01290D556E312C31B7F3A42D /* DeepSink.app */;
@@ -211,6 +214,9 @@
 			);
 			mainGroup = 3E20E01507356B10AA7BB454;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				B9393BA8D1DBDAE96FAD905F /* XCRemoteSwiftPackageReference "argmax-oss-swift" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 9F4E9E15E2614C1FDABADD51 /* Products */;
 			projectDirPath = "";
@@ -263,6 +269,25 @@
 			targetProxy = 83247F1179803A01B74E5F3C /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		B9393BA8D1DBDAE96FAD905F /* XCRemoteSwiftPackageReference "argmax-oss-swift" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/argmaxinc/argmax-oss-swift";
+			requirement = {
+				kind = branch;
+				branch = main;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		9A5047A2CC7E81D6B1F2D0F9 /* WhisperKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = B9393BA8D1DBDAE96FAD905F /* XCRemoteSwiftPackageReference "argmax-oss-swift" */;
+			productName = WhisperKit;
+		};
+/* End XCSwiftPackageProductDependency section */
 
 /* Begin XCBuildConfiguration section */
 		FBB67E8D5A8F4C53F5DC8359 /* Debug */ = {

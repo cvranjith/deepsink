@@ -57,7 +57,7 @@ struct SettingsView: View {
             Section {
                 Toggle("Live Assist", isOn: $settings.liveAssistEnabled)
             } footer: {
-                Text("Runs on-device speech recognition while recording — no audio or text leaves the phone for this — to notice a keyword being said and to give Articulate something recent to work from. Uses extra battery, and needs Speech Recognition permission the first time you turn it on.")
+                Text("Runs on-device Whisper transcription while recording — no audio or text leaves the phone for this — to power the live preview, notice a keyword being said, and give Articulate something recent to work from. Uses extra battery, and downloads a transcription model (once) the first time you turn it on.")
             }
 
             if settings.liveAssistEnabled {

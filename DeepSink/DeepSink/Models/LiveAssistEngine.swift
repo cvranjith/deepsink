@@ -5,45 +5,70 @@
 
 import Foundation
 import AVFoundation
-import Speech
 import Combine
+import WhisperKit
 
 enum LiveAssistError: Error {
     case notAuthorized
+    case modelUnavailable(String)
 
     var message: String {
         switch self {
         case .notAuthorized:
-            return "Speech Recognition access is off — enable it in iPhone Settings > Privacy > Speech Recognition to use Live Assist."
+            return "Microphone access is off — enable it in iPhone Settings > Privacy > Microphone to use Live Assist."
+        case .modelUnavailable(let detail):
+            return "Live Assist's on-device transcription model couldn't load: \(detail)"
         }
     }
 }
 
-// Runs on-device (`requiresOnDeviceRecognition`) speech recognition in
-// parallel with the main recording, for two phase-2 features: the
-// attention/keyword alert, and giving Articulate something recent to
-// work from. No audio or recognized text ever leaves the phone through
+// Runs on-device, real Whisper-quality transcription (WhisperKit's
+// AudioStreamTranscriber) in parallel with the main recording, for the
+// same two phase-2 features as before: the attention/keyword alert, and
+// giving Articulate something recent to work from — now ALSO the
+// primary source of the live preview text itself, replacing Apple's
+// SFSpeechRecognizer entirely (see the 2026-09-24 conversation: once
+// this is genuinely Whisper-quality and on-device, there's no reason to
+// keep the rougher Apple recognizer around as a separate "hot preview"
+// source). No audio or recognized text ever leaves the phone through
 // this path — only the short excerpt Articulate explicitly sends when
-// tapped.
+// tapped, and (opt-in) the same live text already pushed to the web
+// viewer's live_preview.
 //
-// Deliberately a SEPARATE AVAudioEngine + input tap from AudioRecorder's
-// own AVAudioRecorder-based file writing, rather than one unified engine
-// feeding both. Phase-1 recording is already verified working end to end
-// on a real meeting; keeping this fully isolated means Live Assist
-// (opt-in, best-effort — "if I'm not attending with full attention," per
-// the original ask) can never regress the one thing this app absolutely
-// cannot get wrong. Running two independent consumers of the mic input
-// at once is a supported pattern on iOS (distinct from exclusive-access
-// hardware), but hasn't been verified on a real device in this session —
-// worth confirming recording stays glitch-free with Live Assist on
-// before relying on both together in a real meeting.
+// WhisperKit owns its own AVAudioEngine + input tap internally (via its
+// AudioProcessor), deliberately separate from AudioRecorder's own
+// AVAudioRecorder-based file writing — the same "independent mic
+// consumer" pattern this class already used with SFSpeechRecognizer,
+// now proven to work in production on a real device, so carrying it
+// over to WhisperKit's own engine is the same known-safe shape, not a
+// new risk.
+//
+// Unlike SFSpeechRecognizer's single "one open utterance, replaced by
+// each partial result" model, AudioStreamTranscriber continuously
+// re-transcribes a growing rolling buffer and progressively "confirms"
+// segments once enough newer audio has arrived after them - this is
+// what gives you real word-level self-correction as you keep talking
+// (a segment can still be revised right up until it's confirmed), not
+// just a longer-and-longer prefix. See handleTranscriberState below for
+// how that's mapped onto LiveTranscriptBuffer's simpler
+// "one open entry, sealed by finishUtterance()" model: each newly
+// confirmed segment becomes its own sealed entry (with its own real
+// timestamp, so the rolling time-window reads in Articulate keep
+// working), and the still-unconfirmed tail stays one open, overwritable
+// entry until it confirms or the segment set changes shape.
 @MainActor
 final class LiveAssistEngine: ObservableObject {
-    private let engine = AVAudioEngine()
-    private var speechRecognizer: SFSpeechRecognizer?
-    private var request: SFSpeechAudioBufferRecognitionRequest?
-    private var task: SFSpeechRecognitionTask?
-    private var restartTimer: Timer?
+    // Picked as the accuracy/speed middle ground for real-time
+    // transcription on a phone's Neural Engine - "tiny" is explicitly
+    // flagged upstream as debug-only/low-accuracy, "large-v3" (600MB+)
+    // is built for offline batch accuracy, not a rolling live buffer
+    // re-transcribed multiple times a second. Worth revisiting once
+    // this has been tried on a real device.
+    private static let modelName = "base"
+
+    private var whisperKit: WhisperKit?
+    private var audioStreamTranscriber: AudioStreamTranscriber?
+
     // Two separate buffers, same underlying class, different lifetimes -
     // conflating them was the actual bug behind "the live preview keeps
     // erasing what I already said": `buffer` is what Articulate reads
@@ -53,9 +78,7 @@ final class LiveAssistEngine: ObservableObject {
     // line) and is scoped to "since the last chunk actually
     // materialized" instead - cleared only in markMaterialized(upTo:)
     // below, once a chunk's real Whisper transcript has landed, never on
-    // a timer. A fixed rolling window doesn't have a "the real
-    // transcript caught up" concept to align itself with, which is
-    // exactly why using one for this was wrong.
+    // a timer.
     private let buffer = LiveTranscriptBuffer()
     private let livePreviewBuffer = LiveTranscriptBuffer()
 
@@ -63,47 +86,43 @@ final class LiveAssistEngine: ObservableObject {
     private var keywords: [String] = []
     private var alreadyFiredForUtterance = false
 
+    // How many of the transcriber's confirmedSegments have already been
+    // sealed into buffer/livePreviewBuffer as their own entries - only
+    // the delta past this index is new each time the state callback
+    // fires, since confirmedSegments itself is append-only.
+    private var flushedConfirmedCount = 0
+
     private(set) var isRunning = false
     var onKeywordDetected: ((String) -> Void)?
 
     // Everything on-device-recognized since the last chunk actually
     // materialized (see markMaterialized(upTo:)) - not a rolling time
     // window. Read by the recording screen and pushed verbatim to the
-    // web viewer's live_preview (ContentView's startLivePreviewLoop),
-    // so both show exactly the same text. Deliberately labelled as
-    // rough/on-device in the UI: this is Apple's live recognizer, not
-    // the Whisper transcript that eventually replaces it once a chunk
-    // uploads.
+    // web viewer's live_preview (ContentView's startLivePreviewLoop), so
+    // both show exactly the same text. This is now real WhisperKit
+    // output (same model family as the server-side transcript, just a
+    // smaller/faster on-device variant), not a separate "rough" preview
+    // that gets thrown away once the real transcript lands - still
+    // labelled live/on-device in the UI since it can still be revised
+    // right up until a segment confirms.
     @Published private(set) var livePreviewText = ""
 
-    // Not because on-device recognition tasks are documented to have a
-    // hard duration cap (that limit was specifically for server-based
-    // recognition) — a periodic restart is cheap insurance against any
-    // long-running-task degradation over a 2-hour meeting. This buffer is
-    // never shown to the user directly, just matched against and
-    // excerpted, so a restart's brief gap costs nothing that matters.
-    private static let restartInterval: TimeInterval = 240
-
     static func requestAuthorizationIfNeeded() async -> Bool {
-        switch SFSpeechRecognizer.authorizationStatus() {
-        case .authorized:
+        switch AVAudioApplication.shared.recordPermission {
+        case .granted:
             return true
-        case .notDetermined:
-            return await withCheckedContinuation { continuation in
-                SFSpeechRecognizer.requestAuthorization { status in
-                    continuation.resume(returning: status == .authorized)
-                }
-            }
-        case .denied, .restricted:
+        case .undetermined:
+            return await AVAudioApplication.requestRecordPermission()
+        case .denied:
             return false
         @unknown default:
             return false
         }
     }
 
-    func start(keywords: [String]) throws {
+    func start(keywords: [String]) async throws {
         guard !isRunning else { return }
-        guard SFSpeechRecognizer.authorizationStatus() == .authorized else {
+        guard AVAudioApplication.shared.recordPermission == .granted else {
             throw LiveAssistError.notAuthorized
         }
         self.keywords = keywords
@@ -111,40 +130,42 @@ final class LiveAssistEngine: ObservableObject {
         buffer.reset()
         livePreviewBuffer.reset()
         livePreviewText = ""
+        flushedConfirmedCount = 0
+        alreadyFiredForUtterance = false
 
-        let inputNode = engine.inputNode
-        let format = inputNode.outputFormat(forBus: 0)
-        inputNode.removeTap(onBus: 0)
-        // `request.append` from inside a real-time audio tap is the
-        // documented pattern for feeding SFSpeechAudioBufferRecognitionRequest
-        // (see Apple's own Speech framework sample code) — this class is
-        // @MainActor, but the tap callback itself runs on a background
-        // audio thread, so `request` is read here as a plain optional
-        // rather than hopping to the main actor per-buffer, which would
-        // add unnecessary dispatch overhead on a real-time path.
-        inputNode.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] pcmBuffer, _ in
-            self?.request?.append(pcmBuffer)
+        let kit: WhisperKit
+        do {
+            kit = try await loadedWhisperKit()
+        } catch {
+            throw LiveAssistError.modelUnavailable(error.localizedDescription)
         }
-        engine.prepare()
-        try engine.start()
+        guard let tokenizer = kit.tokenizer else {
+            throw LiveAssistError.modelUnavailable("tokenizer unavailable")
+        }
 
-        startRecognitionTask()
-        restartTimer = Timer.scheduledTimer(withTimeInterval: Self.restartInterval, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.restartRecognitionTask() }
+        let transcriber = AudioStreamTranscriber(
+            audioEncoder: kit.audioEncoder,
+            featureExtractor: kit.featureExtractor,
+            segmentSeeker: kit.segmentSeeker,
+            textDecoder: kit.textDecoder,
+            tokenizer: tokenizer,
+            audioProcessor: kit.audioProcessor,
+            decodingOptions: DecodingOptions(task: .transcribe, temperatureFallbackCount: 0)
+        ) { [weak self] _, newState in
+            Task { @MainActor in
+                self?.handleTranscriberState(newState)
+            }
         }
+        audioStreamTranscriber = transcriber
+        try await transcriber.startStreamTranscription()
         isRunning = true
     }
 
     func stop() {
         guard isRunning else { return }
-        restartTimer?.invalidate()
-        restartTimer = nil
-        task?.cancel()
-        task = nil
-        request?.endAudio()
-        request = nil
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
+        let transcriber = audioStreamTranscriber
+        audioStreamTranscriber = nil
+        Task { await transcriber?.stopStreamTranscription() }
         isRunning = false
         livePreviewText = ""
     }
@@ -161,67 +182,80 @@ final class LiveAssistEngine: ObservableObject {
 
     // Called once a chunk's real, Whisper-accurate transcript has landed
     // server-side (ContentView's performChunkUpload, on a successful
-    // upload only — never on a failed one, so the rough text keeps
+    // upload only — never on a failed one, so this on-device text keeps
     // showing until a retry actually succeeds). `offsetSeconds` is in
     // this same engine's own elapsed-since-start clock, matching what
-    // `handle` below timestamps every entry with - the caller is
-    // responsible for converting from AudioRecorder's session-absolute
-    // chunk offsets (which, unlike this engine's clock, keep counting
-    // across a Resume) back to this recording segment's own local time;
-    // see ContentView's own comment at the call site.
+    // handleTranscriberState below timestamps every entry with - the
+    // caller is responsible for converting from AudioRecorder's
+    // session-absolute chunk offsets (which, unlike this engine's clock,
+    // keep counting across a Resume) back to this recording segment's
+    // own local time; see ContentView's own comment at the call site.
     func markMaterialized(upToSessionOffset offsetSeconds: TimeInterval) {
         livePreviewBuffer.trimMaterialized(upTo: offsetSeconds)
         livePreviewText = livePreviewBuffer.allText()
     }
 
-    private func startRecognitionTask() {
-        guard let recognizer = SFSpeechRecognizer(), recognizer.isAvailable else { return }
-        speechRecognizer = recognizer
-        let req = SFSpeechAudioBufferRecognitionRequest()
-        req.shouldReportPartialResults = true
-        req.requiresOnDeviceRecognition = recognizer.supportsOnDeviceRecognition
-        request = req
-        alreadyFiredForUtterance = false
-
-        task = recognizer.recognitionTask(with: req) { [weak self] result, error in
-            Task { @MainActor in
-                self?.handle(result: result, error: error)
-            }
-        }
+    // Loaded once and cached for the lifetime of the app (not per
+    // recording) - model download/compile only needs to happen the
+    // first time this ever runs, same spirit as WhisperKit's own
+    // on-disk model cache backing this up across launches too.
+    private func loadedWhisperKit() async throws -> WhisperKit {
+        if let whisperKit { return whisperKit }
+        let kit = try await WhisperKit(WhisperKitConfig(model: Self.modelName))
+        whisperKit = kit
+        return kit
     }
 
-    private func restartRecognitionTask() {
-        guard isRunning else { return }
-        task?.cancel()
-        request?.endAudio()
-        startRecognitionTask()
-    }
+    private func handleTranscriberState(_ state: AudioStreamTranscriber.State) {
+        guard isRunning || audioStreamTranscriber != nil else { return }
 
-    private func handle(result: SFSpeechRecognitionResult?, error: Error?) {
-        guard let sessionStartDate else { return }
-        if let result {
-            let text = result.bestTranscription.formattedString
-            let elapsed = Date().timeIntervalSince(sessionStartDate)
-            buffer.updateCurrentUtterance(text: text, offsetSeconds: elapsed)
-            livePreviewBuffer.updateCurrentUtterance(text: text, offsetSeconds: elapsed)
-            livePreviewText = livePreviewBuffer.allText()
-            checkKeywords(in: text)
-            if result.isFinal {
+        // Seal off every newly confirmed segment as its own entry, using
+        // that segment's own start time rather than "now" - this is what
+        // keeps Articulate's rolling time-window (recentTranscript(seconds:))
+        // correct instead of collapsing the whole session into one
+        // always-in-range entry.
+        if state.confirmedSegments.count > flushedConfirmedCount {
+            for segment in state.confirmedSegments[flushedConfirmedCount...] {
+                let offset = TimeInterval(segment.start)
+                buffer.updateCurrentUtterance(text: segment.text, offsetSeconds: offset)
                 buffer.finishUtterance()
+                livePreviewBuffer.updateCurrentUtterance(text: segment.text, offsetSeconds: offset)
                 livePreviewBuffer.finishUtterance()
-                alreadyFiredForUtterance = false
             }
-        }
-        if error != nil {
-            // Common/benign at the tail end of a restart, or if the
-            // recognizer briefly has nothing to say — pick recognition
-            // back up rather than silently going dark for the rest of
-            // the meeting.
-            buffer.finishUtterance()
-            livePreviewBuffer.finishUtterance()
+            flushedConfirmedCount = state.confirmedSegments.count
+            // A segment confirming is this model's equivalent of
+            // SFSpeechRecognizer's `isFinal` - lets the same keyword
+            // fire again on a later mention instead of only ever once
+            // per recording.
             alreadyFiredForUtterance = false
-            restartRecognitionTask()
         }
+
+        // The still-unconfirmed tail - re-decoded (and potentially
+        // revised) on every pass until enough newer audio arrives to
+        // confirm it, which is the actual "corrects the previous word as
+        // I keep talking" behavior. Kept as one open, overwritable entry
+        // (LiveTranscriptBuffer's existing shrink-guard already protects
+        // against a revision that gets shorter losing text outright).
+        let tailText: String
+        let tailOffset: TimeInterval
+        if let firstUnconfirmed = state.unconfirmedSegments.first {
+            tailText = state.unconfirmedSegments.map(\.text).joined(separator: " ")
+            tailOffset = TimeInterval(firstUnconfirmed.start)
+        } else if !state.currentText.isEmpty, state.currentText != "Waiting for speech..." {
+            tailText = state.currentText
+            tailOffset = TimeInterval(state.lastConfirmedSegmentEndSeconds)
+        } else {
+            tailText = ""
+            tailOffset = 0
+        }
+
+        if !tailText.isEmpty {
+            buffer.updateCurrentUtterance(text: tailText, offsetSeconds: tailOffset)
+            livePreviewBuffer.updateCurrentUtterance(text: tailText, offsetSeconds: tailOffset)
+            checkKeywords(in: tailText)
+        }
+
+        livePreviewText = livePreviewBuffer.allText()
     }
 
     private func checkKeywords(in text: String) {
