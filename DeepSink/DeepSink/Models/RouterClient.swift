@@ -406,6 +406,18 @@ final class RouterClient: ObservableObject {
         decodeSessionResult(await restRequest(method: "PATCH", path: "deepsink/sessions/\(sessionID)/action_items/\(itemID)", body: ["is_checked": isChecked], settings: settings, timeout: 30))
     }
 
+    // Fills in owner/due by hand when deepsink_notes left either null
+    // (genuinely not inferable from the transcript) - an empty string
+    // clears that field back to null server-side rather than storing
+    // an empty string.
+    func updateActionItem(sessionID: String, itemID: String, owner: String, due: String, settings: AppSettings) async -> Result<DeepSinkSession, RouterError> {
+        let body: [String: Any] = [
+            "owner": owner.isEmpty ? NSNull() : owner,
+            "due": due.isEmpty ? NSNull() : due,
+        ]
+        return decodeSessionResult(await restRequest(method: "PATCH", path: "deepsink/sessions/\(sessionID)/action_items/\(itemID)", body: body, settings: settings, timeout: 30))
+    }
+
     func addMarker(sessionID: String, offsetSeconds: Double, comment: String?, settings: AppSettings) async -> Result<DeepSinkSession, RouterError> {
         var body: [String: Any] = ["offset_seconds": offsetSeconds]
         if let comment { body["comment"] = comment }

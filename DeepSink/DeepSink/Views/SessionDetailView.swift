@@ -51,6 +51,9 @@ struct SessionDetailView: View {
     @State private var notesSaveTask: Task<Void, Never>?
     @State private var renamingSpeaker: SessionSpeaker?
     @State private var renameText = ""
+    @State private var editingActionItem: ServerActionItem?
+    @State private var editOwnerText = ""
+    @State private var editDueText = ""
     @State private var showMarkerSheet = false
     @State private var pendingMarkerOffset: Double?
     @State private var showArticulateSheet = false
@@ -173,6 +176,18 @@ struct SessionDetailView: View {
             }
         } message: {
             Text("Also teaches the server to recognize this voice automatically in future sessions.")
+        }
+        .alert("Edit Action Item", isPresented: Binding(
+            get: { editingActionItem != nil },
+            set: { if !$0 { editingActionItem = nil } }
+        )) {
+            TextField("Owner", text: $editOwnerText)
+            TextField("Due (e.g. 2026-10-05)", text: $editDueText)
+            Button("Cancel", role: .cancel) { editingActionItem = nil }
+            Button("Save") {
+                if let item = editingActionItem { saveActionItemEdit(item) }
+                editingActionItem = nil
+            }
         }
         .task {
             // The list/card this view was pushed from may be showing a
@@ -548,6 +563,10 @@ struct SessionDetailView: View {
                     ForEach(session.actionItems.sorted { $0.sortOrder < $1.sortOrder }) { item in
                         ActionItemRow(item: item) {
                             toggleActionItem(item)
+                        } onEdit: {
+                            editingActionItem = item
+                            editOwnerText = item.owner ?? ""
+                            editDueText = item.due ?? ""
                         }
                     }
                 } footer: {
@@ -591,6 +610,25 @@ struct SessionDetailView: View {
     private func patchField(_ fields: [String: Any]) {
         Task {
             let result = await routerClient.updateSession(id: session.id, fields: fields, settings: settings)
+            switch result {
+            case .success(let updated):
+                session = updated
+                sessionStore.apply(updated)
+            case .failure(let error):
+                actionErrorMessage = error.message
+            }
+        }
+    }
+
+    private func saveActionItemEdit(_ item: ServerActionItem) {
+        Task {
+            let result = await routerClient.updateActionItem(
+                sessionID: session.id,
+                itemID: item.id,
+                owner: editOwnerText.trimmingCharacters(in: .whitespacesAndNewlines),
+                due: editDueText.trimmingCharacters(in: .whitespacesAndNewlines),
+                settings: settings
+            )
             switch result {
             case .success(let updated):
                 session = updated
@@ -705,30 +743,48 @@ struct SessionDetailView: View {
 private struct ActionItemRow: View {
     let item: ServerActionItem
     var onToggle: () -> Void
+    var onEdit: () -> Void
 
     var body: some View {
-        Button {
-            onToggle()
-        } label: {
-            HStack(alignment: .top, spacing: 10) {
+        HStack(alignment: .top, spacing: 10) {
+            Button {
+                onToggle()
+            } label: {
                 Image(systemName: item.isChecked ? "checkmark.square.fill" : "square")
                     .foregroundStyle(item.isChecked ? .green : .secondary)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(item.text)
-                        .strikethrough(item.isChecked)
-                        .foregroundStyle(item.isChecked ? .secondary : .primary)
-                    if (item.owner != nil && !(item.owner ?? "").isEmpty) || (item.due != nil && !(item.due ?? "").isEmpty) {
-                        HStack(spacing: 6) {
-                            if let owner = item.owner, !owner.isEmpty { Text(owner) }
-                            if let due = item.due, !due.isEmpty { Text("· \(due)") }
-                        }
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    }
-                }
             }
+            .buttonStyle(.plain)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(item.text)
+                    .strikethrough(item.isChecked)
+                    .foregroundStyle(item.isChecked ? .secondary : .primary)
+                // Owner/due are fillable, not just displayed - a
+                // missing one still shows a placeholder so there's
+                // always something to tap (see onEdit below), rather
+                // than the row silently having nowhere to add them.
+                HStack(spacing: 6) {
+                    Text(item.owner?.isEmpty == false ? item.owner! : "Owner?")
+                    Text("·")
+                    Text(item.due?.isEmpty == false ? item.due! : "Due?")
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+
+            Button {
+                onEdit()
+            } label: {
+                Image(systemName: "pencil")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
         }
-        .buttonStyle(.plain)
+        .contentShape(Rectangle())
+        .onTapGesture { onEdit() }
     }
 }
 
