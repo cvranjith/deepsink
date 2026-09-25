@@ -29,24 +29,21 @@ final class LiveTranscriptBuffer {
     // right at the boundary never comes up short.
     private let retentionSeconds: TimeInterval = 600
 
+    // Always replaces the open entry's text outright, growing or
+    // shrinking. This used to have a shrink-guard (start a new entry
+    // instead of overwriting whenever the new text was shorter) written
+    // for SFSpeechRecognizer, where a shrink meant a rare internal
+    // glitch losing already-recognized words. That source is gone now -
+    // the current one (WhisperKit's AudioStreamTranscriber) re-decodes
+    // a growing buffer in repeated passes, and EVERY pass's text starts
+    // short and grows again, over and over - "shorter than last time"
+    // is the normal case here, not a glitch. Keeping the old
+    // shrink-guard against this source meant every pass boundary
+    // spawned a new, never-updated entry that stuck around and got
+    // displayed concatenated with the next one - the actual cause of a
+    // sentence visibly appearing to repeat itself.
     func updateCurrentUtterance(text: String, offsetSeconds: TimeInterval) {
-        // Overwrite in place only when the new text is at least as long
-        // as what's already there for this open utterance - the normal
-        // case, since partials are documented to each be a longer
-        // prefix of the last. Guards against a real, observed failure
-        // mode otherwise: on-device recognition isn't reliably stable
-        // over a long continuous utterance and can silently shrink its
-        // own `bestTranscription` (an internal context-window reset)
-        // while still reporting a non-final partial - overwriting in
-        // that case would silently discard everything already
-        // recognized, which is exactly what a user reported seeing
-        // ("only the last few words show, everything before that
-        // disappeared"). Starting a new entry instead keeps it - worst
-        // case this occasionally splits one utterance into two adjacent
-        // entries when the recognizer genuinely revises a phrase
-        // shorter (rare), which just reads as mild, harmless repetition
-        // in what's already labelled a rough preview, never data loss.
-        if isUtteranceOpen, !entries.isEmpty, text.count >= entries[entries.count - 1].text.count {
+        if isUtteranceOpen, !entries.isEmpty {
             entries[entries.count - 1].text = text
         } else {
             entries.append(Entry(offsetSeconds: offsetSeconds, text: text))

@@ -43,19 +43,20 @@ enum LiveAssistError: Error {
 // over to WhisperKit's own engine is the same known-safe shape, not a
 // new risk.
 //
-// Unlike SFSpeechRecognizer's single "one open utterance, replaced by
-// each partial result" model, AudioStreamTranscriber continuously
-// re-transcribes a growing rolling buffer and progressively "confirms"
-// segments once enough newer audio has arrived after them - this is
-// what gives you real word-level self-correction as you keep talking
-// (a segment can still be revised right up until it's confirmed), not
-// just a longer-and-longer prefix. See handleTranscriberState below for
-// how that's mapped onto LiveTranscriptBuffer's simpler
-// "one open entry, sealed by finishUtterance()" model: each newly
-// confirmed segment becomes its own sealed entry (with its own real
-// timestamp, so the rolling time-window reads in Articulate keep
-// working), and the still-unconfirmed tail stays one open, overwritable
-// entry until it confirms or the segment set changes shape.
+// AudioStreamTranscriber continuously re-transcribes a growing rolling
+// buffer in repeated passes rather than delivering one-shot partials
+// like SFSpeechRecognizer did - this is what gives real word-level
+// self-correction as you keep talking. It also exposes a
+// confirmed/unconfirmed segment split meant to progressively "lock in"
+// earlier parts of an utterance, but that turned out unreliable in
+// practice (a "confirmed" segment could still get restated, sometimes
+// repeatedly, in a later pass - see handleTranscriberState's own
+// comment for the full story). This class instead just takes
+// `currentText` - the model's current best transcript for the whole
+// still-open utterance, as one string - and treats a real pause in
+// speech (the library's own "Waiting for speech..." signal) as the only
+// utterance boundary, mapped onto LiveTranscriptBuffer's "one open
+// entry, sealed by finishUtterance()" model.
 @MainActor
 final class LiveAssistEngine: ObservableObject {
     // Picked as the accuracy/speed middle ground for real-time
@@ -85,22 +86,6 @@ final class LiveAssistEngine: ObservableObject {
     private var sessionStartDate: Date?
     private var keywords: [String] = []
     private var alreadyFiredForUtterance = false
-
-    // How many of the transcriber's confirmedSegments have already been
-    // sealed into buffer/livePreviewBuffer as their own entries - only
-    // the delta past this index is new each time the state callback
-    // fires, since confirmedSegments itself is append-only.
-    private var flushedConfirmedCount = 0
-
-    // Guards against sealing the same utterance twice in a row - observed
-    // on a real device (short test recording): confirmedSegments can grow
-    // by a segment that's a near-duplicate of the one just sealed (same
-    // text, an only-slightly-later clip end), rather than genuinely new
-    // speech. Only catches an exact repeat of the immediately preceding
-    // segment, not fuzzy/partial overlap - cheap and safe, not a full fix
-    // for whatever upstream timing produces the duplicate in the first
-    // place.
-    private var lastFlushedSegmentText = ""
 
     private(set) var isRunning = false
     var onKeywordDetected: ((String) -> Void)?
@@ -151,8 +136,6 @@ final class LiveAssistEngine: ObservableObject {
         livePreviewBuffer.reset()
         livePreviewConfirmedText = ""
         livePreviewTailText = ""
-        flushedConfirmedCount = 0
-        lastFlushedSegmentText = ""
         alreadyFiredForUtterance = false
 
         let alreadyLoaded = whisperKit != nil
@@ -277,101 +260,94 @@ final class LiveAssistEngine: ObservableObject {
         return kit
     }
 
+    // WhisperKit's own default download location (HubApi's default,
+    // unchanged here) - Documents/huggingface, inside this app's own
+    // sandboxed container. That's a genuinely persistent location for
+    // ordinary use (survives the app being backgrounded, relaunched, or
+    // updated in place) - it's only wiped when iOS treats an install as
+    // a brand new app rather than an update to the existing one, which
+    // is what happens on this project's free/personal-team signing
+    // every time install_to_deepsink_device.sh mints a fresh
+    // provisioning profile (needed to dodge the 7-day free-tier expiry,
+    // but was doing that unconditionally on every single run - see that
+    // script's own comment for the fix). Exposed here (not just as an
+    // implementation detail) so Settings can show whether a model is
+    // cached and offer to clear it by hand.
+    private static var modelCacheDirectory: URL? {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("huggingface")
+    }
+
+    static func isModelDownloaded() -> Bool {
+        guard let dir = modelCacheDirectory else { return false }
+        return FileManager.default.fileExists(atPath: dir.path)
+    }
+
+    static func modelCacheSizeBytes() -> Int64 {
+        guard let dir = modelCacheDirectory,
+              let enumerator = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: [.fileSizeKey]) else {
+            return 0
+        }
+        var total: Int64 = 0
+        for case let url as URL in enumerator {
+            total += Int64((try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+        }
+        return total
+    }
+
+    // Deletes the on-disk cached model and drops the in-memory
+    // WhisperKit instance, so the next recording re-downloads from
+    // scratch - manual "free up storage" / "force a clean re-download"
+    // control. Not needed for normal use, since the cache is otherwise
+    // reused indefinitely once downloaded.
+    func clearDownloadedModel() {
+        stop()
+        whisperKit = nil
+        if let dir = Self.modelCacheDirectory {
+            try? FileManager.default.removeItem(at: dir)
+        }
+    }
+
     private func handleTranscriberState(_ state: AudioStreamTranscriber.State) {
         guard isRunning || audioStreamTranscriber != nil else { return }
 
-        // Seal off every newly confirmed segment as its own entry, using
-        // that segment's own start time rather than "now" - this is what
-        // keeps Articulate's rolling time-window (recentTranscript(seconds:))
-        // correct instead of collapsing the whole session into one
-        // always-in-range entry.
-        if state.confirmedSegments.count > flushedConfirmedCount {
-            for segment in state.confirmedSegments[flushedConfirmedCount...] {
-                let text = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !text.isEmpty, text != lastFlushedSegmentText else { continue }
-                lastFlushedSegmentText = text
-                let offset = TimeInterval(segment.start)
-                buffer.updateCurrentUtterance(text: text, offsetSeconds: offset)
-                buffer.finishUtterance()
-                livePreviewBuffer.updateCurrentUtterance(text: text, offsetSeconds: offset)
-                livePreviewBuffer.finishUtterance()
-            }
-            flushedConfirmedCount = state.confirmedSegments.count
-            // A segment confirming is this model's equivalent of
-            // SFSpeechRecognizer's `isFinal` - lets the same keyword
-            // fire again on a later mention instead of only ever once
-            // per recording.
-            alreadyFiredForUtterance = false
-        }
-
-        // The still-unconfirmed tail - re-decoded (and potentially
-        // revised) on every pass until enough newer audio arrives to
-        // confirm it, which is the actual "corrects the previous word as
-        // I keep talking" behavior. Kept as one open, overwritable entry
-        // (LiveTranscriptBuffer's existing shrink-guard already protects
-        // against a revision that gets shorter losing text outright).
+        // AudioStreamTranscriber's confirmedSegments/unconfirmedSegments
+        // turned out unreliable on a real device across three separate
+        // attempts to use them here (see this file's git history): a
+        // "confirmed" segment could still get restated - sometimes many
+        // times over, growing a little longer each time - in later
+        // passes instead of the clip boundary reliably advancing past
+        // it. Simpler and robust instead: `currentText` is the model's
+        // own current best transcript for the whole still-open utterance
+        // as of THIS pass, in one string, always fully replacing (never
+        // appending to) whatever was shown before - so there's no
+        // separate "confirmed segment" bookkeeping left that can go
+        // stale or double up.
         //
-        // `currentText` (not `unconfirmedSegments`) is checked FIRST -
-        // it's the live, token-by-token progress of whichever decode
-        // pass is in flight right now; `unconfirmedSegments` is only the
-        // *previous* completed pass's leftover result, reassigned once
-        // when that pass finishes and otherwise stale. Checking
-        // unconfirmedSegments first (the original version of this code)
-        // meant nothing new showed until an entire pass finished - the
-        // real cause of "it stays silent, then a chunk of text appears
-        // all at once" rather than appearing as you speak.
-        var tailText: String
-        let tailOffset: TimeInterval
-        if !state.currentText.isEmpty, state.currentText != "Waiting for speech..." {
-            tailText = state.currentText
-            tailOffset = TimeInterval(state.lastConfirmedSegmentEndSeconds)
-        } else if let firstUnconfirmed = state.unconfirmedSegments.first {
-            tailText = state.unconfirmedSegments.map(\.text).joined(separator: " ")
-            tailOffset = TimeInterval(firstUnconfirmed.start)
-        } else {
-            tailText = ""
-            tailOffset = 0
-        }
-
-        // Each decode pass re-transcribes from state.lastConfirmedSegmentEndSeconds
-        // onward, but in practice (seen on a real device) can still restate
-        // the segment that was JUST confirmed as the start of its own
-        // output, rather than picking up cleanly after it - what showed on
-        // screen as the same sentence appearing once solid, then again
-        // ghosted below it. Strips that overlap word-by-word rather than
-        // trusting the library's clipping to be exact.
-        tailText = Self.stripLeadingOverlap(from: tailText, alreadyConfirmed: lastFlushedSegmentText)
-
-        if !tailText.isEmpty {
-            buffer.updateCurrentUtterance(text: tailText, offsetSeconds: tailOffset)
-            livePreviewBuffer.updateCurrentUtterance(text: tailText, offsetSeconds: tailOffset)
-            checkKeywords(in: tailText)
+        // A pass ending resets currentText to "" before the next pass's
+        // own progress starts refilling it - that's a transient gap
+        // (still mid-utterance, nothing reliable to show yet), not a
+        // pause in speech, so it's simply skipped rather than falling
+        // back to the same unreliable segments arrays. The library's own
+        // "Waiting for speech..." placeholder is what actually signals a
+        // real gap - that's the one moment this treats the utterance as
+        // finished and seals it, so the NEXT thing said starts as its
+        // own fresh entry (keeping Articulate's rolling time-window
+        // meaningful, and letting the same keyword fire again on a later
+        // mention).
+        if state.currentText == "Waiting for speech..." {
+            buffer.finishUtterance()
+            livePreviewBuffer.finishUtterance()
+            alreadyFiredForUtterance = false
+        } else if !state.currentText.isEmpty {
+            let elapsed = sessionStartDate.map { Date().timeIntervalSince($0) } ?? 0
+            buffer.updateCurrentUtterance(text: state.currentText, offsetSeconds: elapsed)
+            livePreviewBuffer.updateCurrentUtterance(text: state.currentText, offsetSeconds: elapsed)
+            checkKeywords(in: state.currentText)
         }
 
         livePreviewConfirmedText = livePreviewBuffer.confirmedText()
         livePreviewTailText = livePreviewBuffer.tailText()
-    }
-
-    // Word-by-word, case/punctuation-insensitive prefix match - drops
-    // however much of `tailText`'s start exactly restates
-    // `alreadyConfirmed` (e.g. "context." vs "context and…" still counts
-    // as the word "context" matching), leaving only the genuinely new
-    // remainder. Leaves tailText untouched the moment a word doesn't
-    // match, rather than trying to align them at other offsets.
-    private static func stripLeadingOverlap(from tailText: String, alreadyConfirmed: String) -> String {
-        guard !alreadyConfirmed.isEmpty, !tailText.isEmpty else { return tailText }
-        func normalized(_ word: Substring) -> String {
-            word.lowercased().trimmingCharacters(in: .punctuationCharacters)
-        }
-        let confirmedWords = alreadyConfirmed.split(separator: " ")
-        let tailWords = tailText.split(separator: " ")
-        var matchCount = 0
-        while matchCount < confirmedWords.count, matchCount < tailWords.count,
-              normalized(confirmedWords[matchCount]) == normalized(tailWords[matchCount]) {
-            matchCount += 1
-        }
-        guard matchCount > 0 else { return tailText }
-        return tailWords[matchCount...].joined(separator: " ")
     }
 
     private func checkKeywords(in text: String) {
