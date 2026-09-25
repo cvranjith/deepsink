@@ -395,9 +395,18 @@ struct SessionDetailView: View {
                         withAnimation(.easeInOut(duration: 0.15)) { selectedTab = tab }
                     } label: {
                         VStack(spacing: 6) {
-                            Text(tab.rawValue)
-                                .font(.subheadline.weight(selectedTab == tab ? .semibold : .regular))
-                                .foregroundStyle(selectedTab == tab ? .primary : .secondary)
+                            HStack(spacing: 4) {
+                                Text(tab.rawValue)
+                                    .font(.subheadline.weight(selectedTab == tab ? .semibold : .regular))
+                                    .foregroundStyle(selectedTab == tab ? .primary : .secondary)
+                                // Visible from any tab, not just while
+                                // looking at Notes itself - the whole
+                                // point of putting it on the tab label.
+                                if tab == .notes, session.isGeneratingNotes || isRegeneratingNotes {
+                                    ProgressView()
+                                        .controlSize(.mini)
+                                }
+                            }
                             Rectangle()
                                 .fill(selectedTab == tab ? Color.accentColor : .clear)
                                 .frame(height: 2)
@@ -426,10 +435,28 @@ struct SessionDetailView: View {
 
     private var notesTab: some View {
         List {
+            if isActiveRecording {
+                Section {
+                    Toggle("Live notes", isOn: Binding(
+                        get: { session.liveNotesEnabled },
+                        set: { setLiveNotesEnabled($0) }
+                    ))
+                } footer: {
+                    Text(session.liveNotesEnabled
+                        ? "Notes regenerate automatically after every chunk."
+                        : "Nothing generates until you ask below, or you stop recording.")
+                }
+            }
             if session.isGeneratingNotes {
                 Section {
-                    HStack { ProgressView(); Text("Generating notes…") }
-                        .foregroundStyle(.secondary)
+                    HStack {
+                        ProgressView()
+                        Text("Generating notes…")
+                        Spacer()
+                        Button("Cancel", role: .destructive) { cancelNotesGeneration() }
+                            .font(.caption)
+                    }
+                    .foregroundStyle(.secondary)
                 }
             }
             if let summary = session.notes?.summary, !summary.isEmpty {
@@ -456,12 +483,21 @@ struct SessionDetailView: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            if session.stageValue == .ready {
+            if session.stageValue == .ready || isActiveRecording {
                 Section {
                     Button {
                         regenerateNotes()
                     } label: {
-                        if isRegeneratingNotes { ProgressView() } else { Text("Regenerate notes") }
+                        if isRegeneratingNotes {
+                            ProgressView()
+                        } else {
+                            // Same call either way (POST .../notes/regenerate,
+                            // "whatever transcript exists right now") - the
+                            // label just reflects what it means in context:
+                            // a manual flush while nothing's automatic yet,
+                            // vs. a plain re-run once recording's done.
+                            Text(isActiveRecording ? "Generate Notes Now" : "Regenerate notes")
+                        }
                     }
                     .disabled(isRegeneratingNotes || session.isGeneratingNotes)
                 }
@@ -752,6 +788,45 @@ struct SessionDetailView: View {
                 session = updated
                 sessionStore.apply(updated)
             case .failure(let error):
+                actionErrorMessage = error.message
+            }
+        }
+    }
+
+    // A soft cancel - the Codex call already running server-side for a
+    // prior regenerateNotes finishes on its own regardless; this just
+    // tells the server not to save whatever it comes back with. The
+    // spinner (session.isGeneratingNotes) clears immediately from this
+    // call's own response, well before that background work actually
+    // finishes - see cancel_notes_generation's own comment server-side.
+    private func cancelNotesGeneration() {
+        Task {
+            let result = await routerClient.cancelNotesGeneration(id: session.id, settings: settings)
+            switch result {
+            case .success(let updated):
+                session = updated
+                sessionStore.apply(updated)
+            case .failure(let error):
+                actionErrorMessage = error.message
+            }
+        }
+    }
+
+    private func setLiveNotesEnabled(_ enabled: Bool) {
+        session.liveNotesEnabled = enabled
+        Task {
+            let result = await routerClient.updateSession(
+                id: session.id, fields: ["live_notes_enabled": enabled], settings: settings
+            )
+            switch result {
+            case .success(let updated):
+                session = updated
+                sessionStore.apply(updated)
+            case .failure(let error):
+                // Revert the optimistic flip above rather than leaving
+                // the toggle showing a state the server never actually
+                // accepted.
+                session.liveNotesEnabled = !enabled
                 actionErrorMessage = error.message
             }
         }

@@ -61,6 +61,23 @@ struct DeepSinkSession: Codable, Identifiable, Equatable {
     // subscription keys off; SessionDetailView's own polling loop uses
     // it too, alongside isGeneratingNotes/isDiarizing.
     var isRecording: Bool
+    // When false, a landing chunk still transcribes and stores as usual,
+    // but the server skips auto-regenerating notes/action-items for it -
+    // "record now, polish once at the end" instead of the default
+    // progressive regen-after-every-chunk behavior (see
+    // deepsink_sessions.py's upload_chunk). Settable at creation
+    // (RouterClient.createSession) and PATCH-able mid-recording
+    // (SessionDetailView's own toggle), independent of AppSettings'
+    // liveNotesEnabled, which is just the default a new recording starts
+    // with.
+    var liveNotesEnabled: Bool
+    // Set by POST .../notes/cancel while a generation is in flight; the
+    // server discards that generation's result instead of saving it once
+    // it finishes. Mirrored here mainly so the UI can tell "generating"
+    // from "generating, but about to be discarded" if it ever needs to -
+    // day to day, isGeneratingNotes flipping back to false is what
+    // actually matters to a viewer.
+    var notesGenerationCancelled: Bool
 }
 
 struct ServerChunk: Codable, Identifiable, Equatable {

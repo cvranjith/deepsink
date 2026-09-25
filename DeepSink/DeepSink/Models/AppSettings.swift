@@ -16,6 +16,7 @@ final class AppSettings: ObservableObject {
         static let chunkTargetSeconds = "chunkTargetSeconds"
         static let announceRecordingReminder = "announceRecordingReminder"
         static let liveAssistEnabled = "liveAssistEnabled"
+        static let liveNotesEnabled = "liveNotesEnabled"
         static let attentionKeywords = "attentionKeywords"
         static let articulateWindowSeconds = "articulateWindowSeconds"
         static let deepSinkUserID = "deepSinkUserID"
@@ -86,6 +87,18 @@ final class AppSettings: ObservableObject {
         didSet { UserDefaults.standard.set(liveAssistEnabled, forKey: Keys.liveAssistEnabled) }
     }
 
+    // The default for a new recording's own live_notes_enabled (server-side
+    // per-session field — see session_store.py) - whether notes/action
+    // items regenerate automatically after every chunk ("live") or only
+    // when explicitly asked ("record now, polish once at the end"). On by
+    // default, matching the behavior before this setting existed. Each
+    // session can still be flipped independently mid-recording
+    // (SessionDetailView's own toggle), so this is just what a fresh
+    // recording starts with, not a global lock.
+    @Published var liveNotesEnabled: Bool {
+        didSet { UserDefaults.standard.set(liveNotesEnabled, forKey: Keys.liveNotesEnabled) }
+    }
+
     // Usually just the user's own name. Matched case-insensitively as a
     // substring of whatever LiveAssistEngine recognizes.
     @Published var attentionKeywords: [String] {
@@ -106,6 +119,7 @@ final class AppSettings: ObservableObject {
         self.chunkTargetSeconds = defaults.object(forKey: Keys.chunkTargetSeconds) as? Int ?? Defaults.chunkTargetSeconds
         self.announceRecordingReminder = defaults.object(forKey: Keys.announceRecordingReminder) as? Bool ?? true
         self.liveAssistEnabled = defaults.bool(forKey: Keys.liveAssistEnabled)
+        self.liveNotesEnabled = defaults.object(forKey: Keys.liveNotesEnabled) as? Bool ?? true
         self.attentionKeywords = defaults.stringArray(forKey: Keys.attentionKeywords) ?? []
         self.articulateWindowSeconds = defaults.object(forKey: Keys.articulateWindowSeconds) as? Int ?? Defaults.articulateWindowSeconds
     }

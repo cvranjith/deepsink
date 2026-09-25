@@ -371,8 +371,14 @@ final class RouterClient: ObservableObject {
     // true from ContentView's actual recording-start path, the only
     // caller that has any business creating a session that immediately
     // looks like it's being recorded.
-    func createSession(title: String, isRecording: Bool = false, settings: AppSettings) async -> Result<DeepSinkSession, RouterError> {
-        decodeSessionResult(await restRequest(method: "POST", path: "deepsink/sessions", body: ["title": title, "is_recording": isRecording], settings: settings, timeout: 30))
+    func createSession(title: String, isRecording: Bool = false, liveNotesEnabled: Bool = true, settings: AppSettings) async -> Result<DeepSinkSession, RouterError> {
+        decodeSessionResult(await restRequest(
+            method: "POST",
+            path: "deepsink/sessions",
+            body: ["title": title, "is_recording": isRecording, "live_notes_enabled": liveNotesEnabled],
+            settings: settings,
+            timeout: 30
+        ))
     }
 
     func getSession(id: String, settings: AppSettings) async -> Result<DeepSinkSession, RouterError> {
@@ -422,6 +428,16 @@ final class RouterClient: ObservableObject {
 
     func regenerateNotes(id: String, settings: AppSettings) async -> Result<DeepSinkSession, RouterError> {
         decodeSessionResult(await restRequest(method: "POST", path: "deepsink/sessions/\(id)/notes/regenerate", body: nil, settings: settings, timeout: 180))
+    }
+
+    // Soft-cancel: doesn't stop the Codex subprocess already running
+    // server-side for a prior regenerateNotes call, just tells the server
+    // to discard that call's result instead of saving it once it
+    // finishes - see cancel_notes_generation's own comment in
+    // deepsink_sessions.py. Short timeout since this itself is just a
+    // flag flip, not something that waits on Codex.
+    func cancelNotesGeneration(id: String, settings: AppSettings) async -> Result<DeepSinkSession, RouterError> {
+        decodeSessionResult(await restRequest(method: "POST", path: "deepsink/sessions/\(id)/notes/cancel", body: nil, settings: settings, timeout: 30))
     }
 
     func toggleActionItem(sessionID: String, itemID: String, isChecked: Bool, settings: AppSettings) async -> Result<DeepSinkSession, RouterError> {

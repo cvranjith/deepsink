@@ -41,6 +41,12 @@ struct SettingsView: View {
             }
 
             Section {
+                Toggle("Live notes while recording", isOn: $settings.liveNotesEnabled)
+            } footer: {
+                Text("On: notes and action items regenerate on the server automatically after every chunk, so they're already there by the time you stop. Off: nothing generates until you ask (a \"Generate Notes\" button on the recording screen) or you stop the recording — good for \"just record, polish once at the end.\" This is just the default for a new recording — you can still flip it for one recording in progress.")
+            }
+
+            Section {
                 Stepper(value: $settings.chunkTargetSeconds, in: 60...600, step: 30) {
                     HStack {
                         Text("Chunk length")

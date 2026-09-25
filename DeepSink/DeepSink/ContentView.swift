@@ -225,7 +225,9 @@ struct ContentView: View {
             }
 
             let title = DeepSinkSession.defaultTitle(for: Date())
-            let created = await routerClient.createSession(title: title, isRecording: true, settings: settings)
+            let created = await routerClient.createSession(
+                title: title, isRecording: true, liveNotesEnabled: settings.liveNotesEnabled, settings: settings
+            )
             let session: DeepSinkSession
             switch created {
             case .success(let value):
