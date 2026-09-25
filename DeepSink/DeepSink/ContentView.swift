@@ -37,6 +37,7 @@ struct ContentView: View {
     @State private var activeSession: DeepSinkSession?
     @State private var navigateToSessionID: String?
     @State private var recordError: String?
+    @State private var showRecordSetup = false
     @State private var liveAssistError: String?
 
     // Chunks upload to the server as soon as AudioRecorder finishes
@@ -119,6 +120,14 @@ struct ContentView: View {
                     Button("OK", role: .cancel) {}
                 } message: {
                     Text(liveAssistError ?? "")
+                }
+                .sheet(isPresented: $showRecordSetup) {
+                    RecordSetupSheet(settings: settings) { title, titleIsManual, category, liveNotesEnabled, diarizationEnabled in
+                        startRecording(
+                            title: title, titleIsManual: titleIsManual, category: category,
+                            liveNotesEnabled: liveNotesEnabled, diarizationEnabled: diarizationEnabled
+                        )
+                    }
                 }
         }
         .onAppear {
@@ -206,7 +215,7 @@ struct ContentView: View {
     }
 
     private var recordButton: some View {
-        Button(action: startRecording) {
+        Button { showRecordSetup = true } label: {
             Image(systemName: "record.circle.fill")
                 .resizable()
                 .frame(width: 72, height: 72)
@@ -216,7 +225,9 @@ struct ContentView: View {
         .accessibilityLabel("Start recording")
     }
 
-    private func startRecording() {
+    private func startRecording(
+        title: String, titleIsManual: Bool, category: String, liveNotesEnabled: Bool, diarizationEnabled: Bool
+    ) {
         Task {
             let granted = await AVAudioApplication.requestRecordPermission()
             guard granted else {
@@ -224,17 +235,29 @@ struct ContentView: View {
                 return
             }
 
-            let title = DeepSinkSession.defaultTitle(for: Date())
             let created = await routerClient.createSession(
-                title: title, isRecording: true, liveNotesEnabled: settings.liveNotesEnabled, settings: settings
+                title: title, isRecording: true, liveNotesEnabled: liveNotesEnabled,
+                category: category, diarizationEnabled: diarizationEnabled, settings: settings
             )
-            let session: DeepSinkSession
+            var session: DeepSinkSession
             switch created {
             case .success(let value):
                 session = value
             case .failure(let error):
                 recordError = "Couldn't start a session on the server: \(error.message)"
                 return
+            }
+            if titleIsManual {
+                // createSession itself never sets title_is_manual (a
+                // plain title-only create - e.g. the web viewer's own
+                // "+ New Session" - should never look pre-locked) -
+                // PATCHing the same title right after is what actually
+                // flips it, via patch_session's own special-casing. See
+                // title_is_manual's own comment in session_store.py.
+                let patched = await routerClient.updateSession(id: session.id, fields: ["title": title], settings: settings)
+                if case .success(let updated) = patched {
+                    session = updated
+                }
             }
             sessionStore.apply(session)
             await beginRecording(session: session, startingChunkIndex: 0, baseOffsetSeconds: 0, deleteSessionOnFailure: true)

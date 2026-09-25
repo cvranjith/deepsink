@@ -112,8 +112,13 @@ final class LiveAssistEngine: ObservableObject {
     // result - nothing left to revise once it's in. So unlike the
     // streaming design this replaced, everything lands in
     // `livePreviewConfirmedText` (full brightness); `livePreviewTailText`
-    // only ever holds a brief "Transcribing…" placeholder while a chunk
-    // is being processed, not real partial text.
+    // is unused for now (kept only so the confirmed/tail split still
+    // compiles against SessionDetailView's existing rendering) - a
+    // "Transcribing…" placeholder used to appear here while a chunk was
+    // processing, but appearing/disappearing on its own timer shifted
+    // the whole Transcript tab's layout underneath it (a real, reported
+    // flicker), for a fact ("it's transcribing in the background") that
+    // didn't need saying.
     @Published private(set) var livePreviewConfirmedText = ""
     @Published private(set) var livePreviewTailText = ""
 
@@ -306,7 +311,6 @@ final class LiveAssistEngine: ObservableObject {
             processor.purgeAudioSamples(keepingLast: 0)
             guard !samples.isEmpty else { continue }
 
-            livePreviewTailText = "Transcribing…"
             do {
                 let options = DecodingOptions(task: .transcribe, skipSpecialTokens: true)
                 let results = try await kit.transcribe(audioArray: samples, decodeOptions: options)
@@ -314,14 +318,12 @@ final class LiveAssistEngine: ObservableObject {
                     results.map(\.text).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
                 )
                 guard isRunning else { return }
-                livePreviewTailText = ""
                 if !text.isEmpty {
                     appendChunk(text)
                 }
                 statusMessage = "Listening…"
             } catch {
                 guard isRunning else { return }
-                livePreviewTailText = ""
                 statusMessage = "Transcription error: \(error.localizedDescription)"
             }
         }

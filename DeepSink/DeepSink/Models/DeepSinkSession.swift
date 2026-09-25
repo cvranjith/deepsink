@@ -78,6 +78,20 @@ struct DeepSinkSession: Codable, Identifiable, Equatable {
     // day to day, isGeneratingNotes flipping back to false is what
     // actually matters to a viewer.
     var notesGenerationCancelled: Bool
+    // One of "meeting" | "todo" | "voice_note", chosen on the recording
+    // setup sheet - passed through to deepsink_notes.handle() server-side,
+    // which uses it to shift the notes-generation prompt's emphasis (see
+    // INSTRUCTIONS_BY_CATEGORY in deepsink_notes.py). Not a fixed Swift
+    // enum on purpose: an unrecognized value just falls back to "meeting"
+    // behavior server-side, so this stays forward-compatible with a
+    // category added there before this app knows about it.
+    var category: String
+    // When false, speaker detection never runs for this session (see
+    // isDiarizing's own gating server-side) and each chunk's audio is
+    // deleted right after it transcribes rather than kept until /finish -
+    // diarization is the only reason the server needs to hold onto raw
+    // audio at all.
+    var diarizationEnabled: Bool
 }
 
 struct ServerChunk: Codable, Identifiable, Equatable {

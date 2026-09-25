@@ -17,6 +17,7 @@ final class AppSettings: ObservableObject {
         static let announceRecordingReminder = "announceRecordingReminder"
         static let liveAssistEnabled = "liveAssistEnabled"
         static let liveNotesEnabled = "liveNotesEnabled"
+        static let diarizationEnabled = "diarizationEnabled"
         static let attentionKeywords = "attentionKeywords"
         static let articulateWindowSeconds = "articulateWindowSeconds"
         static let deepSinkUserID = "deepSinkUserID"
@@ -99,6 +100,16 @@ final class AppSettings: ObservableObject {
         didSet { UserDefaults.standard.set(liveNotesEnabled, forKey: Keys.liveNotesEnabled) }
     }
 
+    // The default for a new recording's own diarization_enabled
+    // (server-side per-session field). Off skips speaker detection
+    // entirely and, since that's the only reason the server keeps raw
+    // audio around past transcription, deletes each chunk's audio right
+    // after it transcribes instead of waiting for the whole recording to
+    // finish - see upload_chunk's own comment server-side.
+    @Published var diarizationEnabled: Bool {
+        didSet { UserDefaults.standard.set(diarizationEnabled, forKey: Keys.diarizationEnabled) }
+    }
+
     // Usually just the user's own name. Matched case-insensitively as a
     // substring of whatever LiveAssistEngine recognizes.
     @Published var attentionKeywords: [String] {
@@ -120,6 +131,7 @@ final class AppSettings: ObservableObject {
         self.announceRecordingReminder = defaults.object(forKey: Keys.announceRecordingReminder) as? Bool ?? true
         self.liveAssistEnabled = defaults.bool(forKey: Keys.liveAssistEnabled)
         self.liveNotesEnabled = defaults.object(forKey: Keys.liveNotesEnabled) as? Bool ?? true
+        self.diarizationEnabled = defaults.object(forKey: Keys.diarizationEnabled) as? Bool ?? true
         self.attentionKeywords = defaults.stringArray(forKey: Keys.attentionKeywords) ?? []
         self.articulateWindowSeconds = defaults.object(forKey: Keys.articulateWindowSeconds) as? Int ?? Defaults.articulateWindowSeconds
     }
