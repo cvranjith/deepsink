@@ -246,7 +246,17 @@ final class LiveAssistEngine: ObservableObject {
     // on-disk model cache backing this up across launches too.
     private func loadedWhisperKit() async throws -> WhisperKit {
         if let whisperKit { return whisperKit }
-        let kit = try await WhisperKit(WhisperKitConfig(model: Self.modelName))
+        // `load: true` is NOT the default here — WhisperKitConfig only
+        // auto-loads (which is what actually populates `tokenizer`) when
+        // `load` is passed explicitly or a local `modelFolder` was given
+        // (see WhisperKit.init: `config.load ?? (config.modelFolder !=
+        // nil)`). Passing just `model:` downloads the model but silently
+        // skips loadModels() otherwise, which is exactly what produced
+        // "tokenizer unavailable" on a real device — the CLI this was
+        // verified against on macOS passes `load: true` itself
+        // (TranscribeCLIUtils), which is what made that test pass while
+        // this same model/download path failed here.
+        let kit = try await WhisperKit(WhisperKitConfig(model: Self.modelName, load: true))
         whisperKit = kit
         return kit
     }
