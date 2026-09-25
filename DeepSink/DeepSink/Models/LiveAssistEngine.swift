@@ -95,17 +95,20 @@ final class LiveAssistEngine: ObservableObject {
     private(set) var isRunning = false
     var onKeywordDetected: ((String) -> Void)?
 
-    // Everything on-device-recognized since the last chunk actually
-    // materialized (see markMaterialized(upTo:)) - not a rolling time
-    // window. Read by the recording screen and pushed verbatim to the
-    // web viewer's live_preview (ContentView's startLivePreviewLoop), so
-    // both show exactly the same text. This is now real WhisperKit
-    // output (same model family as the server-side transcript, just a
-    // smaller/faster on-device variant), not a separate "rough" preview
-    // that gets thrown away once the real transcript lands - still
-    // labelled live/on-device in the UI since it can still be revised
-    // right up until a segment confirms.
-    @Published private(set) var livePreviewText = ""
+    // Split so the UI can render the settled part at full brightness and
+    // the still-revisable tail dimmer/italic, the way captions/dictation
+    // UIs usually distinguish "done" from "still deciding" - see
+    // LiveTranscriptBuffer's confirmedText()/tailText(). Read by the
+    // recording screen; `livePreviewText` below (their concatenation) is
+    // what's pushed verbatim to the web viewer's live_preview
+    // (ContentView's startLivePreviewLoop), so it shows the same overall
+    // text even without the confirmed/tail visual split.
+    @Published private(set) var livePreviewConfirmedText = ""
+    @Published private(set) var livePreviewTailText = ""
+
+    var livePreviewText: String {
+        [livePreviewConfirmedText, livePreviewTailText].filter { !$0.isEmpty }.joined(separator: " ")
+    }
 
     static func requestAuthorizationIfNeeded() async -> Bool {
         switch AVAudioApplication.shared.recordPermission {
@@ -129,7 +132,8 @@ final class LiveAssistEngine: ObservableObject {
         sessionStartDate = Date()
         buffer.reset()
         livePreviewBuffer.reset()
-        livePreviewText = ""
+        livePreviewConfirmedText = ""
+        livePreviewTailText = ""
         flushedConfirmedCount = 0
         alreadyFiredForUtterance = false
 
@@ -167,7 +171,8 @@ final class LiveAssistEngine: ObservableObject {
         audioStreamTranscriber = nil
         Task { await transcriber?.stopStreamTranscription() }
         isRunning = false
-        livePreviewText = ""
+        livePreviewConfirmedText = ""
+        livePreviewTailText = ""
     }
 
     func updateKeywords(_ keywords: [String]) {
@@ -192,7 +197,8 @@ final class LiveAssistEngine: ObservableObject {
     // own local time; see ContentView's own comment at the call site.
     func markMaterialized(upToSessionOffset offsetSeconds: TimeInterval) {
         livePreviewBuffer.trimMaterialized(upTo: offsetSeconds)
-        livePreviewText = livePreviewBuffer.allText()
+        livePreviewConfirmedText = livePreviewBuffer.confirmedText()
+        livePreviewTailText = livePreviewBuffer.tailText()
     }
 
     // Loaded once and cached for the lifetime of the app (not per
@@ -236,14 +242,24 @@ final class LiveAssistEngine: ObservableObject {
         // I keep talking" behavior. Kept as one open, overwritable entry
         // (LiveTranscriptBuffer's existing shrink-guard already protects
         // against a revision that gets shorter losing text outright).
+        //
+        // `currentText` (not `unconfirmedSegments`) is checked FIRST -
+        // it's the live, token-by-token progress of whichever decode
+        // pass is in flight right now; `unconfirmedSegments` is only the
+        // *previous* completed pass's leftover result, reassigned once
+        // when that pass finishes and otherwise stale. Checking
+        // unconfirmedSegments first (the original version of this code)
+        // meant nothing new showed until an entire pass finished - the
+        // real cause of "it stays silent, then a chunk of text appears
+        // all at once" rather than appearing as you speak.
         let tailText: String
         let tailOffset: TimeInterval
-        if let firstUnconfirmed = state.unconfirmedSegments.first {
-            tailText = state.unconfirmedSegments.map(\.text).joined(separator: " ")
-            tailOffset = TimeInterval(firstUnconfirmed.start)
-        } else if !state.currentText.isEmpty, state.currentText != "Waiting for speech..." {
+        if !state.currentText.isEmpty, state.currentText != "Waiting for speech..." {
             tailText = state.currentText
             tailOffset = TimeInterval(state.lastConfirmedSegmentEndSeconds)
+        } else if let firstUnconfirmed = state.unconfirmedSegments.first {
+            tailText = state.unconfirmedSegments.map(\.text).joined(separator: " ")
+            tailOffset = TimeInterval(firstUnconfirmed.start)
         } else {
             tailText = ""
             tailOffset = 0
@@ -255,7 +271,8 @@ final class LiveAssistEngine: ObservableObject {
             checkKeywords(in: tailText)
         }
 
-        livePreviewText = livePreviewBuffer.allText()
+        livePreviewConfirmedText = livePreviewBuffer.confirmedText()
+        livePreviewTailText = livePreviewBuffer.tailText()
     }
 
     private func checkKeywords(in text: String) {

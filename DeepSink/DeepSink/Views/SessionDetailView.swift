@@ -472,6 +472,24 @@ struct SessionDetailView: View {
     // MARK: - Transcript tab (also markers + speakers — both are transcript-contextual)
 
     private var transcriptTab: some View {
+        ScrollViewReader { proxy in
+            transcriptList
+                .onChange(of: session.transcriptBlocks.count) { _, _ in scrollTranscriptToBottom(proxy) }
+                .onChange(of: liveAssistEngine.livePreviewConfirmedText) { _, _ in scrollTranscriptToBottom(proxy) }
+                .onChange(of: liveAssistEngine.livePreviewTailText) { _, _ in scrollTranscriptToBottom(proxy) }
+                .onAppear { scrollTranscriptToBottom(proxy, animated: false) }
+        }
+    }
+
+    private func scrollTranscriptToBottom(_ proxy: ScrollViewProxy, animated: Bool = true) {
+        if animated {
+            withAnimation { proxy.scrollTo("transcript-bottom", anchor: .bottom) }
+        } else {
+            proxy.scrollTo("transcript-bottom", anchor: .bottom)
+        }
+    }
+
+    private var transcriptList: some View {
         List {
             if session.stageValue == .ready {
                 Section {
@@ -513,14 +531,20 @@ struct SessionDetailView: View {
                 }
             }
             // The live line only ever shows while this device is the one
-            // actively recording this exact session — rough, on-device
-            // recognition of whatever's currently being said, not yet
-            // transcribed by the server. Disappears the moment the chunk
-            // it's part of actually uploads and lands as real
-            // transcriptBlocks below it (same relationship the web
-            // viewer's live_preview has to its own transcript).
-            let liveText = isActiveRecording ? liveAssistEngine.livePreviewText : ""
-            if session.transcriptBlocks.isEmpty && liveText.isEmpty {
+            // actively recording this exact session — on-device
+            // WhisperKit transcription of whatever's currently being
+            // said, not yet transcribed by the server. Disappears the
+            // moment the chunk it's part of actually uploads and lands
+            // as real transcriptBlocks below it (same relationship the
+            // web viewer's live_preview has to its own transcript).
+            //
+            // Split into confirmed (settled, won't change again — full
+            // brightness) and tail (still being revised as more audio
+            // arrives — dim/italic), matching LiveAssistEngine's own
+            // confirmed/tail split.
+            let confirmedLive = isActiveRecording ? liveAssistEngine.livePreviewConfirmedText : ""
+            let tailLive = isActiveRecording ? liveAssistEngine.livePreviewTailText : ""
+            if session.transcriptBlocks.isEmpty && confirmedLive.isEmpty && tailLive.isEmpty {
                 Section {
                     Text(isActiveRecording ? "Listening…" : "No transcript yet.")
                         .foregroundStyle(.secondary)
@@ -528,11 +552,22 @@ struct SessionDetailView: View {
             } else {
                 Section("Transcript") {
                     TranscriptBlocksList(session: session)
-                    if !liveText.isEmpty {
-                        Text(liveText)
-                            .italic()
-                            .foregroundStyle(.secondary)
+                    if !confirmedLive.isEmpty || !tailLive.isEmpty {
+                        VStack(alignment: .leading, spacing: 2) {
+                            if !confirmedLive.isEmpty {
+                                Text(confirmedLive)
+                                    .foregroundStyle(.primary)
+                            }
+                            if !tailLive.isEmpty {
+                                Text(tailLive)
+                                    .italic()
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
                     }
+                    Color.clear
+                        .frame(height: 1)
+                        .id("transcript-bottom")
                 }
             }
         }

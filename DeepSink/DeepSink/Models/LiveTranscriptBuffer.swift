@@ -88,6 +88,25 @@ final class LiveTranscriptBuffer {
             .joined(separator: " ")
     }
 
+    // Everything except the still-open entry (if any) — the part of the
+    // live preview that's settled and won't be revised again, for a UI
+    // that wants to visually distinguish it (e.g. full brightness) from
+    // the still-in-progress tail below.
+    func confirmedText() -> String {
+        let settled = isUtteranceOpen ? entries.dropLast() : entries[...]
+        return settled
+            .filter { !$0.text.isEmpty }
+            .map(\.text)
+            .joined(separator: " ")
+    }
+
+    // Just the still-open entry's text (empty if there isn't one right
+    // now) — the part that can still change as more audio arrives.
+    func tailText() -> String {
+        guard isUtteranceOpen, let last = entries.last else { return "" }
+        return last.text
+    }
+
     // Drops everything at or before `offsetSeconds` — for when a chunk's
     // real, Whisper-accurate transcript has actually landed and this
     // buffer's rough version of that same stretch of time should stop
