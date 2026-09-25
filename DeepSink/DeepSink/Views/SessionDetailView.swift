@@ -546,7 +546,7 @@ struct SessionDetailView: View {
             let tailLive = isActiveRecording ? liveAssistEngine.livePreviewTailText : ""
             if session.transcriptBlocks.isEmpty && confirmedLive.isEmpty && tailLive.isEmpty {
                 Section {
-                    Text(isActiveRecording ? "Listening…" : "No transcript yet.")
+                    Text(isActiveRecording ? (liveAssistEngine.statusMessage ?? "Listening…") : "No transcript yet.")
                         .foregroundStyle(.secondary)
                 }
             } else {

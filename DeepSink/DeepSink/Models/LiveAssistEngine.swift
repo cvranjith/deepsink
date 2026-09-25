@@ -95,6 +95,13 @@ final class LiveAssistEngine: ObservableObject {
     private(set) var isRunning = false
     var onKeywordDetected: ((String) -> Void)?
 
+    // Visible, persistent status for the recording screen - a silent
+    // failure here (model download stalling/failing, the transcriber
+    // never actually starting) previously looked identical to "working
+    // but nothing said yet," with no way to tell them apart short of a
+    // transient alert that's easy to miss. This stays on screen instead.
+    @Published private(set) var statusMessage: String?
+
     // Split so the UI can render the settled part at full brightness and
     // the still-revisable tail dimmer/italic, the way captions/dictation
     // UIs usually distinguish "done" from "still deciding" - see
@@ -137,13 +144,17 @@ final class LiveAssistEngine: ObservableObject {
         flushedConfirmedCount = 0
         alreadyFiredForUtterance = false
 
+        let alreadyLoaded = whisperKit != nil
+        statusMessage = alreadyLoaded ? "Starting…" : "Downloading on-device transcription model…"
         let kit: WhisperKit
         do {
             kit = try await loadedWhisperKit()
         } catch {
+            statusMessage = "Model load failed: \(error.localizedDescription)"
             throw LiveAssistError.modelUnavailable(error.localizedDescription)
         }
         guard let tokenizer = kit.tokenizer else {
+            statusMessage = "Model load failed: tokenizer unavailable"
             throw LiveAssistError.modelUnavailable("tokenizer unavailable")
         }
 
@@ -161,8 +172,35 @@ final class LiveAssistEngine: ObservableObject {
             }
         }
         audioStreamTranscriber = transcriber
-        try await transcriber.startStreamTranscription()
+
+        // `startStreamTranscription()` does NOT return once transcription
+        // actually starts — internally it awaits its own `while
+        // state.isRecording` loop directly, so it only returns after
+        // `stopStreamTranscription()` ends that loop. Awaiting it inline
+        // here (the first version of this code) meant `isRunning = true`
+        // below was unreachable until the recording *stopped* — so
+        // `isRunning` stayed false for the entire recording, `stop()`'s
+        // own `guard isRunning else { return }` made Stop a no-op against
+        // it (leaking a still-running transcriber into the next
+        // recording), and nothing distinguished "quietly working" from
+        // "silently never started." Reported by the user as: no live
+        // text at all, "listening" the whole time, then transcript/notes
+        // only appearing once the server-side pipeline finished — a
+        // second, independent path from the live preview, which explains
+        // why it "worked" while this was completely dark.
         isRunning = true
+        statusMessage = "Listening…"
+        Task { [weak self] in
+            do {
+                try await transcriber.startStreamTranscription()
+            } catch {
+                await MainActor.run {
+                    guard self?.audioStreamTranscriber === transcriber else { return }
+                    self?.statusMessage = "Live Assist stopped: \(error.localizedDescription)"
+                    self?.isRunning = false
+                }
+            }
+        }
     }
 
     func stop() {
@@ -171,6 +209,7 @@ final class LiveAssistEngine: ObservableObject {
         audioStreamTranscriber = nil
         Task { await transcriber?.stopStreamTranscription() }
         isRunning = false
+        statusMessage = nil
         livePreviewConfirmedText = ""
         livePreviewTailText = ""
     }
