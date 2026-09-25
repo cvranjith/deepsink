@@ -320,7 +320,7 @@ final class LiveAssistEngine: ObservableObject {
         // meant nothing new showed until an entire pass finished - the
         // real cause of "it stays silent, then a chunk of text appears
         // all at once" rather than appearing as you speak.
-        let tailText: String
+        var tailText: String
         let tailOffset: TimeInterval
         if !state.currentText.isEmpty, state.currentText != "Waiting for speech..." {
             tailText = state.currentText
@@ -333,6 +333,15 @@ final class LiveAssistEngine: ObservableObject {
             tailOffset = 0
         }
 
+        // Each decode pass re-transcribes from state.lastConfirmedSegmentEndSeconds
+        // onward, but in practice (seen on a real device) can still restate
+        // the segment that was JUST confirmed as the start of its own
+        // output, rather than picking up cleanly after it - what showed on
+        // screen as the same sentence appearing once solid, then again
+        // ghosted below it. Strips that overlap word-by-word rather than
+        // trusting the library's clipping to be exact.
+        tailText = Self.stripLeadingOverlap(from: tailText, alreadyConfirmed: lastFlushedSegmentText)
+
         if !tailText.isEmpty {
             buffer.updateCurrentUtterance(text: tailText, offsetSeconds: tailOffset)
             livePreviewBuffer.updateCurrentUtterance(text: tailText, offsetSeconds: tailOffset)
@@ -341,6 +350,28 @@ final class LiveAssistEngine: ObservableObject {
 
         livePreviewConfirmedText = livePreviewBuffer.confirmedText()
         livePreviewTailText = livePreviewBuffer.tailText()
+    }
+
+    // Word-by-word, case/punctuation-insensitive prefix match - drops
+    // however much of `tailText`'s start exactly restates
+    // `alreadyConfirmed` (e.g. "context." vs "context and…" still counts
+    // as the word "context" matching), leaving only the genuinely new
+    // remainder. Leaves tailText untouched the moment a word doesn't
+    // match, rather than trying to align them at other offsets.
+    private static func stripLeadingOverlap(from tailText: String, alreadyConfirmed: String) -> String {
+        guard !alreadyConfirmed.isEmpty, !tailText.isEmpty else { return tailText }
+        func normalized(_ word: Substring) -> String {
+            word.lowercased().trimmingCharacters(in: .punctuationCharacters)
+        }
+        let confirmedWords = alreadyConfirmed.split(separator: " ")
+        let tailWords = tailText.split(separator: " ")
+        var matchCount = 0
+        while matchCount < confirmedWords.count, matchCount < tailWords.count,
+              normalized(confirmedWords[matchCount]) == normalized(tailWords[matchCount]) {
+            matchCount += 1
+        }
+        guard matchCount > 0 else { return tailText }
+        return tailWords[matchCount...].joined(separator: " ")
     }
 
     private func checkKeywords(in text: String) {
