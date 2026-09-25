@@ -310,7 +310,9 @@ final class LiveAssistEngine: ObservableObject {
             do {
                 let options = DecodingOptions(task: .transcribe, skipSpecialTokens: true)
                 let results = try await kit.transcribe(audioArray: samples, decodeOptions: options)
-                let text = results.map(\.text).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+                let text = Self.stripNonSpeechPlaceholders(
+                    results.map(\.text).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+                )
                 guard isRunning else { return }
                 livePreviewTailText = ""
                 if !text.isEmpty {
@@ -323,6 +325,23 @@ final class LiveAssistEngine: ObservableObject {
                 statusMessage = "Transcription error: \(error.localizedDescription)"
             }
         }
+    }
+
+    // Whisper's own placeholder for audio it decoded as silent/non-speech
+    // (seen on a real device: "[BLANK_AUDIO]" showing up as its own
+    // chunk) - these are a known artifact of the model itself, not
+    // something skipSpecialTokens filters (those are the tokenizer's own
+    // control tokens; this is literal generated text). Stripped as a
+    // bracketed/parenthetical all-caps-or-lowercase-word tag anywhere in
+    // the string, not just a whole-string match, since it can also show
+    // up attached to real speech in the same chunk.
+    private static func stripNonSpeechPlaceholders(_ text: String) -> String {
+        let withoutTags = text.replacingOccurrences(
+            of: #"\[[A-Za-z _]+\]|\([A-Za-z ]+\)"#,
+            with: "",
+            options: .regularExpression
+        )
+        return withoutTags.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     // Each poll chunk is a complete, already-final piece of text - sealed
