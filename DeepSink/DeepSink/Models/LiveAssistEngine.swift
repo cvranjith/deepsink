@@ -92,6 +92,16 @@ final class LiveAssistEngine: ObservableObject {
     // fires, since confirmedSegments itself is append-only.
     private var flushedConfirmedCount = 0
 
+    // Guards against sealing the same utterance twice in a row - observed
+    // on a real device (short test recording): confirmedSegments can grow
+    // by a segment that's a near-duplicate of the one just sealed (same
+    // text, an only-slightly-later clip end), rather than genuinely new
+    // speech. Only catches an exact repeat of the immediately preceding
+    // segment, not fuzzy/partial overlap - cheap and safe, not a full fix
+    // for whatever upstream timing produces the duplicate in the first
+    // place.
+    private var lastFlushedSegmentText = ""
+
     private(set) var isRunning = false
     var onKeywordDetected: ((String) -> Void)?
 
@@ -142,6 +152,7 @@ final class LiveAssistEngine: ObservableObject {
         livePreviewConfirmedText = ""
         livePreviewTailText = ""
         flushedConfirmedCount = 0
+        lastFlushedSegmentText = ""
         alreadyFiredForUtterance = false
 
         let alreadyLoaded = whisperKit != nil
@@ -165,7 +176,12 @@ final class LiveAssistEngine: ObservableObject {
             textDecoder: kit.textDecoder,
             tokenizer: tokenizer,
             audioProcessor: kit.audioProcessor,
-            decodingOptions: DecodingOptions(task: .transcribe, temperatureFallbackCount: 0)
+            // skipSpecialTokens defaults to false in DecodingOptions -
+            // without it, decoded text literally includes Whisper's own
+            // control tokens (<|startoftranscript|><|en|>...<|endoftext|>
+            // etc.), which is exactly what showed up on screen. The CLI
+            // this was verified against sets this explicitly too.
+            decodingOptions: DecodingOptions(task: .transcribe, temperatureFallbackCount: 0, skipSpecialTokens: true)
         ) { [weak self] _, newState in
             Task { @MainActor in
                 self?.handleTranscriberState(newState)
@@ -271,10 +287,13 @@ final class LiveAssistEngine: ObservableObject {
         // always-in-range entry.
         if state.confirmedSegments.count > flushedConfirmedCount {
             for segment in state.confirmedSegments[flushedConfirmedCount...] {
+                let text = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !text.isEmpty, text != lastFlushedSegmentText else { continue }
+                lastFlushedSegmentText = text
                 let offset = TimeInterval(segment.start)
-                buffer.updateCurrentUtterance(text: segment.text, offsetSeconds: offset)
+                buffer.updateCurrentUtterance(text: text, offsetSeconds: offset)
                 buffer.finishUtterance()
-                livePreviewBuffer.updateCurrentUtterance(text: segment.text, offsetSeconds: offset)
+                livePreviewBuffer.updateCurrentUtterance(text: text, offsetSeconds: offset)
                 livePreviewBuffer.finishUtterance()
             }
             flushedConfirmedCount = state.confirmedSegments.count
