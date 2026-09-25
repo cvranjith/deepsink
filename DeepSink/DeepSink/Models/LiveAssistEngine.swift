@@ -22,64 +22,75 @@ enum LiveAssistError: Error {
     }
 }
 
-// Runs on-device, real Whisper-quality transcription (WhisperKit's
-// AudioStreamTranscriber) in parallel with the main recording, for the
-// same two phase-2 features as before: the attention/keyword alert, and
-// giving Articulate something recent to work from — now ALSO the
-// primary source of the live preview text itself, replacing Apple's
-// SFSpeechRecognizer entirely (see the 2026-09-24 conversation: once
-// this is genuinely Whisper-quality and on-device, there's no reason to
-// keep the rougher Apple recognizer around as a separate "hot preview"
-// source). No audio or recognized text ever leaves the phone through
-// this path — only the short excerpt Articulate explicitly sends when
-// tapped, and (opt-in) the same live text already pushed to the web
-// viewer's live_preview.
+// Runs on-device, real Whisper-quality transcription in parallel with the
+// main recording, for the same two phase-2 features as before: the
+// attention/keyword alert, and giving Articulate something recent to work
+// from — now ALSO the primary source of the live preview text itself,
+// replacing Apple's SFSpeechRecognizer entirely (see the 2026-09-24
+// conversation: once this is genuinely Whisper-quality and on-device,
+// there's no reason to keep the rougher Apple recognizer around as a
+// separate "hot preview" source). No audio or recognized text ever leaves
+// the phone through this path — only the short excerpt Articulate
+// explicitly sends when tapped, and (opt-in) the same live text already
+// pushed to the web viewer's live_preview.
 //
-// WhisperKit owns its own AVAudioEngine + input tap internally (via its
-// AudioProcessor), deliberately separate from AudioRecorder's own
-// AVAudioRecorder-based file writing — the same "independent mic
-// consumer" pattern this class already used with SFSpeechRecognizer,
-// now proven to work in production on a real device, so carrying it
-// over to WhisperKit's own engine is the same known-safe shape, not a
-// new risk.
+// Deliberately NOT WhisperKit's own AudioStreamTranscriber, despite that
+// being the obvious "streaming" API - four different attempts to use it
+// here (see this file's git history) all produced the same real-device
+// failure mode in the end: the same stretch of speech restated, sometimes
+// repeatedly and each time a little longer, rather than a decode pass
+// reliably picking up only where the last one left off. Whatever the exact
+// cause upstream, its "confirmed segment" and "currentText" signals both
+// turned out unreliable enough here that patching around them symptom by
+// symptom wasn't converging.
 //
-// AudioStreamTranscriber continuously re-transcribes a growing rolling
-// buffer in repeated passes rather than delivering one-shot partials
-// like SFSpeechRecognizer did - this is what gives real word-level
-// self-correction as you keep talking. It also exposes a
-// confirmed/unconfirmed segment split meant to progressively "lock in"
-// earlier parts of an utterance, but that turned out unreliable in
-// practice (a "confirmed" segment could still get restated, sometimes
-// repeatedly, in a later pass - see handleTranscriberState's own
-// comment for the full story). This class instead just takes
-// `currentText` - the model's current best transcript for the whole
-// still-open utterance, as one string - and treats a real pause in
-// speech (the library's own "Waiting for speech..." signal) as the only
-// utterance boundary, mapped onto LiveTranscriptBuffer's "one open
-// entry, sealed by finishUtterance()" model.
+// Instead, this owns the audio capture loop directly: WhisperKit's own
+// AudioProcessor (via `kit.audioProcessor`) does the mic tap and buffering
+// exactly like AudioStreamTranscriber would have (same "independent
+// AVAudioEngine, separate from AudioRecorder's own" pattern, proven safe
+// on a real device already), but instead of letting the library re-decode
+// the same growing buffer forever, this polls it on a short interval,
+// transcribes whatever's accumulated with one plain `WhisperKit.transcribe
+// (audioArray:)` call, and then PURGES that audio
+// (`audioProcessor.purgeAudioSamples(keepingLast: 0)`) — so the next poll
+// can only ever see genuinely new audio. Structurally, not just by
+// tuning, this can't re-show the same words twice: there's no shared
+// buffer left for a later pass to re-read. The trade-off is coarser
+// granularity (new text arrives every couple of seconds in short
+// sentence-sized pieces, not token-by-token) rather than the fancier
+// live-revising-as-you-speak behavior AudioStreamTranscriber promised but
+// didn't reliably deliver here.
 @MainActor
 final class LiveAssistEngine: ObservableObject {
     // Picked as the accuracy/speed middle ground for real-time
     // transcription on a phone's Neural Engine - "tiny" is explicitly
     // flagged upstream as debug-only/low-accuracy, "large-v3" (600MB+)
-    // is built for offline batch accuracy, not a rolling live buffer
-    // re-transcribed multiple times a second. Worth revisiting once
-    // this has been tried on a real device.
+    // is built for offline batch accuracy, not a buffer transcribed
+    // every couple of seconds. Worth revisiting with real usage.
     private static let modelName = "base"
 
-    private var whisperKit: WhisperKit?
-    private var audioStreamTranscriber: AudioStreamTranscriber?
+    // How long to let audio accumulate before transcribing it - a floor
+    // (below this, a poll tick just waits for more) rather than a fixed
+    // cadence, so a short utterance still shows up promptly once this
+    // much has landed, and a poll tick that fires mid-word just waits for
+    // the next one rather than transcribing a fragment.
+    private static let minChunkSeconds: Double = 2.5
+    // Hard cap regardless of what's been said - keeps worst-case latency
+    // bounded even through one long continuous sentence with no pause.
+    private static let maxChunkSeconds: Double = 6.0
+    private static let pollInterval: Duration = .milliseconds(500)
 
-    // Two separate buffers, same underlying class, different lifetimes -
-    // conflating them was the actual bug behind "the live preview keeps
-    // erasing what I already said": `buffer` is what Articulate reads
-    // (recentTranscript(seconds:)), a genuine rolling time-window that's
-    // supposed to forget old content; `livePreviewBuffer` backs
-    // `livePreviewText` (the recording screen and web viewer's live
-    // line) and is scoped to "since the last chunk actually
-    // materialized" instead - cleared only in markMaterialized(upTo:)
-    // below, once a chunk's real Whisper transcript has landed, never on
-    // a timer.
+    private var whisperKit: WhisperKit?
+    private var audioProcessor: (any AudioProcessing)?
+    private var pollTask: Task<Void, Never>?
+
+    // `buffer` is what Articulate reads (recentTranscript(seconds:)), a
+    // genuine rolling time-window that's supposed to forget old content;
+    // `livePreviewBuffer` backs `livePreviewText` (the recording screen
+    // and web viewer's live line) and is scoped to "since the last chunk
+    // actually materialized" instead - cleared only in
+    // markMaterialized(upTo:) below, once a chunk's real Whisper
+    // transcript has landed, never on a timer.
     private let buffer = LiveTranscriptBuffer()
     private let livePreviewBuffer = LiveTranscriptBuffer()
 
@@ -91,20 +102,18 @@ final class LiveAssistEngine: ObservableObject {
     var onKeywordDetected: ((String) -> Void)?
 
     // Visible, persistent status for the recording screen - a silent
-    // failure here (model download stalling/failing, the transcriber
-    // never actually starting) previously looked identical to "working
-    // but nothing said yet," with no way to tell them apart short of a
+    // failure here (model download stalling/failing, transcription never
+    // actually starting) previously looked identical to "working but
+    // nothing said yet," with no way to tell them apart short of a
     // transient alert that's easy to miss. This stays on screen instead.
     @Published private(set) var statusMessage: String?
 
-    // Split so the UI can render the settled part at full brightness and
-    // the still-revisable tail dimmer/italic, the way captions/dictation
-    // UIs usually distinguish "done" from "still deciding" - see
-    // LiveTranscriptBuffer's confirmedText()/tailText(). Read by the
-    // recording screen; `livePreviewText` below (their concatenation) is
-    // what's pushed verbatim to the web viewer's live_preview
-    // (ContentView's startLivePreviewLoop), so it shows the same overall
-    // text even without the confirmed/tail visual split.
+    // Every chunk here is already a complete, one-shot transcription
+    // result - nothing left to revise once it's in. So unlike the
+    // streaming design this replaced, everything lands in
+    // `livePreviewConfirmedText` (full brightness); `livePreviewTailText`
+    // only ever holds a brief "Transcribing…" placeholder while a chunk
+    // is being processed, not real partial text.
     @Published private(set) var livePreviewConfirmedText = ""
     @Published private(set) var livePreviewTailText = ""
 
@@ -147,66 +156,28 @@ final class LiveAssistEngine: ObservableObject {
             statusMessage = "Model load failed: \(error.localizedDescription)"
             throw LiveAssistError.modelUnavailable(error.localizedDescription)
         }
-        guard let tokenizer = kit.tokenizer else {
-            statusMessage = "Model load failed: tokenizer unavailable"
-            throw LiveAssistError.modelUnavailable("tokenizer unavailable")
-        }
 
-        let transcriber = AudioStreamTranscriber(
-            audioEncoder: kit.audioEncoder,
-            featureExtractor: kit.featureExtractor,
-            segmentSeeker: kit.segmentSeeker,
-            textDecoder: kit.textDecoder,
-            tokenizer: tokenizer,
-            audioProcessor: kit.audioProcessor,
-            // skipSpecialTokens defaults to false in DecodingOptions -
-            // without it, decoded text literally includes Whisper's own
-            // control tokens (<|startoftranscript|><|en|>...<|endoftext|>
-            // etc.), which is exactly what showed up on screen. The CLI
-            // this was verified against sets this explicitly too.
-            decodingOptions: DecodingOptions(task: .transcribe, temperatureFallbackCount: 0, skipSpecialTokens: true)
-        ) { [weak self] _, newState in
-            Task { @MainActor in
-                self?.handleTranscriberState(newState)
-            }
+        let processor = kit.audioProcessor
+        do {
+            try processor.startRecordingLive(inputDeviceID: nil, callback: nil)
+        } catch {
+            statusMessage = "Microphone start failed: \(error.localizedDescription)"
+            throw LiveAssistError.modelUnavailable(error.localizedDescription)
         }
-        audioStreamTranscriber = transcriber
-
-        // `startStreamTranscription()` does NOT return once transcription
-        // actually starts — internally it awaits its own `while
-        // state.isRecording` loop directly, so it only returns after
-        // `stopStreamTranscription()` ends that loop. Awaiting it inline
-        // here (the first version of this code) meant `isRunning = true`
-        // below was unreachable until the recording *stopped* — so
-        // `isRunning` stayed false for the entire recording, `stop()`'s
-        // own `guard isRunning else { return }` made Stop a no-op against
-        // it (leaking a still-running transcriber into the next
-        // recording), and nothing distinguished "quietly working" from
-        // "silently never started." Reported by the user as: no live
-        // text at all, "listening" the whole time, then transcript/notes
-        // only appearing once the server-side pipeline finished — a
-        // second, independent path from the live preview, which explains
-        // why it "worked" while this was completely dark.
+        audioProcessor = processor
         isRunning = true
         statusMessage = "Listening…"
-        Task { [weak self] in
-            do {
-                try await transcriber.startStreamTranscription()
-            } catch {
-                await MainActor.run {
-                    guard self?.audioStreamTranscriber === transcriber else { return }
-                    self?.statusMessage = "Live Assist stopped: \(error.localizedDescription)"
-                    self?.isRunning = false
-                }
-            }
+        pollTask = Task { [weak self] in
+            await self?.pollLoop(kit: kit, processor: processor)
         }
     }
 
     func stop() {
         guard isRunning else { return }
-        let transcriber = audioStreamTranscriber
-        audioStreamTranscriber = nil
-        Task { await transcriber?.stopStreamTranscription() }
+        pollTask?.cancel()
+        pollTask = nil
+        audioProcessor?.stopRecording()
+        audioProcessor = nil
         isRunning = false
         statusMessage = nil
         livePreviewConfirmedText = ""
@@ -228,11 +199,11 @@ final class LiveAssistEngine: ObservableObject {
     // upload only — never on a failed one, so this on-device text keeps
     // showing until a retry actually succeeds). `offsetSeconds` is in
     // this same engine's own elapsed-since-start clock, matching what
-    // handleTranscriberState below timestamps every entry with - the
-    // caller is responsible for converting from AudioRecorder's
-    // session-absolute chunk offsets (which, unlike this engine's clock,
-    // keep counting across a Resume) back to this recording segment's
-    // own local time; see ContentView's own comment at the call site.
+    // the poll loop below timestamps every entry with - the caller is
+    // responsible for converting from AudioRecorder's session-absolute
+    // chunk offsets (which, unlike this engine's clock, keep counting
+    // across a Resume) back to this recording segment's own local time;
+    // see ContentView's own comment at the call site.
     func markMaterialized(upToSessionOffset offsetSeconds: TimeInterval) {
         livePreviewBuffer.trimMaterialized(upTo: offsetSeconds)
         livePreviewConfirmedText = livePreviewBuffer.confirmedText()
@@ -251,10 +222,7 @@ final class LiveAssistEngine: ObservableObject {
         // (see WhisperKit.init: `config.load ?? (config.modelFolder !=
         // nil)`). Passing just `model:` downloads the model but silently
         // skips loadModels() otherwise, which is exactly what produced
-        // "tokenizer unavailable" on a real device — the CLI this was
-        // verified against on macOS passes `load: true` itself
-        // (TranscribeCLIUtils), which is what made that test pass while
-        // this same model/download path failed here.
+        // "tokenizer unavailable" on a real device.
         let kit = try await WhisperKit(WhisperKitConfig(model: Self.modelName, load: true))
         whisperKit = kit
         return kit
@@ -308,46 +276,67 @@ final class LiveAssistEngine: ObservableObject {
         }
     }
 
-    private func handleTranscriberState(_ state: AudioStreamTranscriber.State) {
-        guard isRunning || audioStreamTranscriber != nil else { return }
+    // The whole live-preview loop: wait for enough new audio, transcribe
+    // it as a one-shot (not streaming) call, purge exactly what was just
+    // transcribed, repeat. Purging is what makes repetition structurally
+    // impossible here - each call only ever sees audio the previous call
+    // never touched.
+    private func pollLoop(kit: WhisperKit, processor: any AudioProcessing) async {
+        let sampleRate = Double(WhisperKit.sampleRate)
+        while !Task.isCancelled, isRunning {
+            try? await Task.sleep(for: Self.pollInterval)
+            guard !Task.isCancelled, isRunning else { return }
 
-        // AudioStreamTranscriber's confirmedSegments/unconfirmedSegments
-        // turned out unreliable on a real device across three separate
-        // attempts to use them here (see this file's git history): a
-        // "confirmed" segment could still get restated - sometimes many
-        // times over, growing a little longer each time - in later
-        // passes instead of the clip boundary reliably advancing past
-        // it. Simpler and robust instead: `currentText` is the model's
-        // own current best transcript for the whole still-open utterance
-        // as of THIS pass, in one string, always fully replacing (never
-        // appending to) whatever was shown before - so there's no
-        // separate "confirmed segment" bookkeeping left that can go
-        // stale or double up.
-        //
-        // A pass ending resets currentText to "" before the next pass's
-        // own progress starts refilling it - that's a transient gap
-        // (still mid-utterance, nothing reliable to show yet), not a
-        // pause in speech, so it's simply skipped rather than falling
-        // back to the same unreliable segments arrays. The library's own
-        // "Waiting for speech..." placeholder is what actually signals a
-        // real gap - that's the one moment this treats the utterance as
-        // finished and seals it, so the NEXT thing said starts as its
-        // own fresh entry (keeping Articulate's rolling time-window
-        // meaningful, and letting the same keyword fire again on a later
-        // mention).
-        if state.currentText == "Waiting for speech..." {
-            buffer.finishUtterance()
-            livePreviewBuffer.finishUtterance()
-            alreadyFiredForUtterance = false
-        } else if !state.currentText.isEmpty {
-            let elapsed = sessionStartDate.map { Date().timeIntervalSince($0) } ?? 0
-            buffer.updateCurrentUtterance(text: state.currentText, offsetSeconds: elapsed)
-            livePreviewBuffer.updateCurrentUtterance(text: state.currentText, offsetSeconds: elapsed)
-            checkKeywords(in: state.currentText)
+            let sampleCount = processor.audioSamples.count
+            let seconds = Double(sampleCount) / sampleRate
+            guard seconds >= Self.minChunkSeconds else { continue }
+
+            // A natural pause (the same energy-based VAD AudioStreamTranscriber
+            // itself uses) lets a short utterance flush promptly instead of
+            // always waiting for the max cap - but doesn't block on it either,
+            // so a long continuous sentence still flushes at the cap.
+            let pausedRecently = AudioProcessor.isVoiceDetected(
+                in: processor.relativeEnergy,
+                nextBufferInSeconds: 1.0,
+                silenceThreshold: 0.3
+            ) == false
+            guard pausedRecently || seconds >= Self.maxChunkSeconds else { continue }
+
+            let samples = Array(processor.audioSamples)
+            processor.purgeAudioSamples(keepingLast: 0)
+            guard !samples.isEmpty else { continue }
+
+            livePreviewTailText = "Transcribing…"
+            do {
+                let options = DecodingOptions(task: .transcribe, skipSpecialTokens: true)
+                let results = try await kit.transcribe(audioArray: samples, decodeOptions: options)
+                let text = results.map(\.text).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+                guard isRunning else { return }
+                livePreviewTailText = ""
+                if !text.isEmpty {
+                    appendChunk(text)
+                }
+                statusMessage = "Listening…"
+            } catch {
+                guard isRunning else { return }
+                livePreviewTailText = ""
+                statusMessage = "Transcription error: \(error.localizedDescription)"
+            }
         }
+    }
 
+    // Each poll chunk is a complete, already-final piece of text - sealed
+    // immediately (finishUtterance right after), not left open for a
+    // later revision the way a true streaming source would.
+    private func appendChunk(_ text: String) {
+        let elapsed = sessionStartDate.map { Date().timeIntervalSince($0) } ?? 0
+        buffer.updateCurrentUtterance(text: text, offsetSeconds: elapsed)
+        buffer.finishUtterance()
+        livePreviewBuffer.updateCurrentUtterance(text: text, offsetSeconds: elapsed)
+        livePreviewBuffer.finishUtterance()
+        checkKeywords(in: text)
+        alreadyFiredForUtterance = false
         livePreviewConfirmedText = livePreviewBuffer.confirmedText()
-        livePreviewTailText = livePreviewBuffer.tailText()
     }
 
     private func checkKeywords(in text: String) {
