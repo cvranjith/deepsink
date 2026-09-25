@@ -88,16 +88,31 @@ if [ -z "$DEVICE_ID" ]; then
 fi
 echo "Using device: $DEVICE_ID"
 
-echo "==> Clearing cached provisioning profiles"
 # Free (personal-team) provisioning profiles are only valid 7 days, and the
 # app stops launching when its profile expires. Xcode's automatic signing
 # *reuses* a cached profile as long as it still has any validity left, so a
 # mid-week reinstall would inherit the original expiry instead of getting a
-# fresh 7 days. Deleting the cache forces Xcode to mint a new profile on
-# every run, resetting the clock. Harmless with a paid account (those
-# profiles just get regenerated with their normal 1-year validity).
-rm -f ~/Library/MobileDevice/Provisioning\ Profiles/*.mobileprovision 2>/dev/null || true
-rm -f ~/Library/Developer/Xcode/UserData/Provisioning\ Profiles/*.mobileprovision 2>/dev/null || true
+# fresh 7 days. Deleting the cache forces Xcode to mint a new profile,
+# resetting the clock. Harmless with a paid account (those profiles just get
+# regenerated with their normal 1-year validity).
+#
+# Only done when the cached profile is actually getting old (5+ days),
+# not on every single run — a fresh profile makes iOS treat the install as
+# a different app from the one already there, wiping its sandboxed
+# container (Documents, Library, ...) rather than updating in place. During
+# active development this script runs far more often than "weekly" (every
+# code change gets reinstalled to test it), so wiping unconditionally was
+# quietly deleting on-device app data — e.g. LiveAssistEngine's downloaded
+# WhisperKit model — on nearly every install, not just the intended weekly
+# refresh.
+PROFILE_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
+if [ -n "$(find "$PROFILE_DIR" -maxdepth 1 -name '*.mobileprovision' -newermt '-5 days' 2>/dev/null)" ]; then
+  echo "==> Cached provisioning profile is recent enough — skipping refresh (preserves on-device app data)"
+else
+  echo "==> Clearing cached provisioning profiles (none newer than 5 days)"
+  rm -f ~/Library/MobileDevice/Provisioning\ Profiles/*.mobileprovision 2>/dev/null || true
+  rm -f ~/Library/Developer/Xcode/UserData/Provisioning\ Profiles/*.mobileprovision 2>/dev/null || true
+fi
 
 echo "==> Building for device (no Simulator involved)"
 # With the profile cache wiped above and two targets needing fresh profiles

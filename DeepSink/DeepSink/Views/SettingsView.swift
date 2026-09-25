@@ -8,8 +8,14 @@ import SwiftUI
 struct SettingsView: View {
     @EnvironmentObject var settings: AppSettings
     @EnvironmentObject var routerClient: RouterClient
+    @EnvironmentObject var liveAssistEngine: LiveAssistEngine
     @State private var isTestingLogin = false
     @State private var loginMessage: String?
+    // Re-read on demand (appear + right after Clear) rather than made
+    // reactive/@Published on the engine - this is a plain on-disk fact
+    // that only ever changes because of an action taken right here.
+    @State private var isModelDownloaded = LiveAssistEngine.isModelDownloaded()
+    @State private var modelCacheSizeBytes: Int64 = 0
 
     var body: some View {
         Form {
@@ -56,8 +62,20 @@ struct SettingsView: View {
 
             Section {
                 Toggle("Live Assist", isOn: $settings.liveAssistEnabled)
+                HStack {
+                    Text("Transcription model")
+                    Spacer()
+                    Text(isModelDownloaded ? "Downloaded (\(formattedSize(modelCacheSizeBytes)))" : "Not downloaded")
+                        .foregroundStyle(.secondary)
+                }
+                if isModelDownloaded {
+                    Button("Clear Downloaded Model", role: .destructive) {
+                        liveAssistEngine.clearDownloadedModel()
+                        refreshModelStatus()
+                    }
+                }
             } footer: {
-                Text("Runs on-device Whisper transcription while recording — no audio or text leaves the phone for this — to power the live preview, notice a keyword being said, and give Articulate something recent to work from. Uses extra battery, and downloads a transcription model (once) the first time you turn it on.")
+                Text("Runs on-device Whisper transcription while recording — no audio or text leaves the phone for this — to power the live preview, notice a keyword being said, and give Articulate something recent to work from. Uses extra battery. Downloaded once and reused after that — clearing it just forces a fresh download next time, e.g. to free up storage.")
             }
 
             if settings.liveAssistEnabled {
@@ -119,11 +137,21 @@ struct SettingsView: View {
             }
         }
         .navigationTitle("Settings")
+        .onAppear { refreshModelStatus() }
         .alert("DeepSink Login", isPresented: Binding(get: { loginMessage != nil }, set: { if !$0 { loginMessage = nil } })) {
             Button("OK", role: .cancel) {}
         } message: {
             Text(loginMessage ?? "")
         }
+    }
+
+    private func refreshModelStatus() {
+        isModelDownloaded = LiveAssistEngine.isModelDownloaded()
+        modelCacheSizeBytes = isModelDownloaded ? LiveAssistEngine.modelCacheSizeBytes() : 0
+    }
+
+    private func formattedSize(_ bytes: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
     }
 
     private func testLogin() async {
@@ -143,4 +171,5 @@ struct SettingsView: View {
     }
     .environmentObject(AppSettings())
     .environmentObject(RouterClient())
+    .environmentObject(LiveAssistEngine())
 }
