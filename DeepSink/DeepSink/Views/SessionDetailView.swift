@@ -567,9 +567,9 @@ struct SessionDetailView: View {
                 }
             }
             // The live line only ever shows while this device is the one
-            // actively recording this exact session — on-device
-            // WhisperKit transcription of whatever's currently being
-            // said, not yet transcribed by the server. Disappears the
+            // actively recording this exact session — Apple's on-device
+            // speech recognition of whatever's currently being said, not
+            // yet transcribed by the server. Disappears the
             // moment the chunk it's part of actually uploads and lands
             // as real transcriptBlocks below it (same relationship the
             // web viewer's live_preview has to its own transcript).
@@ -582,7 +582,7 @@ struct SessionDetailView: View {
             let tailLive = isActiveRecording ? liveAssistEngine.livePreviewTailText : ""
             if session.transcriptBlocks.isEmpty && confirmedLive.isEmpty && tailLive.isEmpty {
                 Section {
-                    Text(isActiveRecording ? (liveAssistEngine.statusMessage ?? "Listening…") : "No transcript yet.")
+                    Text(isActiveRecording ? "Listening…" : "No transcript yet.")
                         .foregroundStyle(.secondary)
                 }
             } else {
